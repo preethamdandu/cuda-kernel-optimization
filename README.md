@@ -291,76 +291,95 @@ Triton tiled matmul (`triton/matmul.py`, 64×64×32) against `torch.matmul`. Bot
 
 Triton reaches **78.3% of cuBLAS** at 4096 against Stage 5's **61.5%**, and beats the five-stage CUDA ladder outright (2640 vs 2046 GF/s) in about 80 lines of Python. That is the productivity-versus-control point: Triton won on this GPU, and the CUDA ladder is how you see why.
 
-Running with `--tf32` on the T4 produces byte-identical error (7.63e-05 / 1.60e-04) and the same ~78% ratio, which is the expected result — sm_75 has no TF32 path, so the flag is a no-op. The flag exists because on Ada it is [emphatically not](#triton-4090--tf32-not-fp32).
+Running with `--tf32` on the T4 produces byte-identical error (7.63e-05 / 1.60e-04) and the same ~78% ratio, which is the expected result — sm_75 has no TF32 path, so the flag is a no-op. On Ada it is [not a no-op](#triton-4090).
 
 ## RTX 4090 (RunPod, 2026-08-21)
 
-Same binaries, compiled `-arch=sm_89`. **GPU:** NVIDIA GeForce RTX 4090, 128 SMs, sm_89. Peak DRAM 1008.10 GB/s (mem clock 10501 MHz, 384-bit bus). Headline numbers are N=4096. **Do not put these in the T4 table.**
+Same `scripts/run_all.sh`, compiled `-arch=sm_89`. **GPU:** NVIDIA GeForce RTX 4090, 128 SMs, sm_89, 1536 threads/SM, 72 MiB L2. Peak DRAM 1008.10 GB/s (mem clock 10501 MHz, 384-bit bus). Headline numbers are N=4096. **Do not put these in the T4 table.**
 
 | Stage | Kernel | Precision | GFLOP/s | % cuBLAS | Req GB/s | Max abs err | Max rel err | Notes |
 |---|---|---|---:|---:|---:|---:|---:|---|
-| 1 | Naive (uncoalesced) | FP32 | 683.23 | 1.16 | 2733 | 3.36e-04† | 3.03e-06† | `threadIdx.x` → row |
-| 2 | Coalesced | FP32 | 5602.65 | 9.54 | 22413 | 3.36e-04† | 3.03e-06† | **8.2×** naive |
-| 3 | Shared-memory tiled | FP32 | 4517.12 | 7.69 | 18071 | 3.36e-04† | 3.03e-06† | **lost** to Stage 2 at every size |
-| 4 | Register blocked | FP32 | 30162.64 | 51.33 | 120665 | 3.36e-04† | 3.03e-06† | **5.4×** coalesced |
-| 5 | Vectorized loads | FP32 | 31573.96 | 54.55 | 126311 | 3.36e-04† | 3.03e-06† | **+4.7%** over Stage 4 |
-| 6 | WMMA / Tensor Cores | FP16→FP32 | 46303 | 30.0‡ | 92628 | 7.86e-04† | 7.10e-06† | vs cuBLAS **FP16**, not FP32 |
+| 1 | Naive (uncoalesced) | FP32 | 678.97 | 1.20 | 2716 | 3.36e-04† | 3.03e-06† | `threadIdx.x` → row |
+| 2 | Coalesced | FP32 | 5578.42 | 9.87 | 22316 | 3.36e-04† | 3.03e-06† | **8.2×** naive |
+| 3 | Shared-memory tiled | FP32 | 4492.91 | 7.91 | 17974 | 3.36e-04† | 3.03e-06† | **lost** to Stage 2 at every size |
+| 4 | Register blocked | FP32 | 31660.35 | 56.00 | 126657 | 3.36e-04† | 3.03e-06† | **5.7×** coalesced |
+| 5 | Vectorized loads | FP32 | 30414.17 | 54.20 | 121672 | 3.36e-04† | 3.03e-06† | **−3.9%** vs Stage 4 |
+| 6 | WMMA / Tensor Cores | FP16→FP32 | 50150 | 30.3‡ | 100325 | 7.86e-04† | 7.10e-06† | vs cuBLAS **FP16**, not FP32 |
 
-† FP32/WMMA error quoted from N=4096. N=1024 FP32 matched cuBLAS bit for bit — inverted from the T4, where 4096 was the matching size, which is [the evidence that this tracks cuBLAS kernel selection](#about-the-bitwise-matches) rather than a compiler or checker bug. WMMA differs from cuBLAS at all three sizes here.  
-‡ Stage 6 `% cuBLAS` is vs `cublasGemmEx` FP16 (~154 TFLOPS at 4096), **not** vs FP32 cuBLAS (~58.8 TFLOPS). Do not put 30% and 55% in the same sentence.
+† Error quoted from N=4096. N=1024 FP32 matched cuBLAS bit for bit — inverted from the T4, where 4096 was the matching size, which is [the evidence that this tracks cuBLAS kernel selection](#about-the-bitwise-matches). WMMA differs from cuBLAS at all three sizes. Fail elems = 0 on every row.  
+‡ Stage 6 `% cuBLAS` is vs `cublasGemmEx` FP16 (165 TFLOPS at 4096), **not** vs FP32 cuBLAS (56.4 TFLOPS). Do not put 30% and 56% in the same sentence.
 
-cuBLAS FP32 ~58.8 TFLOPS is a healthy 4090 baseline. Coalesced/naive is **8.2×** (5603 / 683). Tiling lost everywhere (4517 vs 5603 at 4096) — stronger miss than T4. Register blocking is still the real jump. Vectorized *lost* at N=1024 vs register (27486 vs 30002) and won by 4.7% at 4096. WMMA **46.3 TFLOPS, 30% of FP16 cuBLAS** vs T4's 10% — same teaching kernel, Ada Tensor Cores are the matching baseline.
+cuBLAS FP32 at 56.4 TFLOPS is a healthy 4090 baseline. Coalesced/naive is **8.2×** (5578 / 679), same ratio as the previous 4090 session. Tiling lost everywhere (4493 vs 5578 at 4096) — a stronger miss than T4, and it is stable across both 4090 runs. Register blocking is still the real jump. Vectorized *lost* to register at 1024 and 4096 and won only at 2048; the earlier “+4.7% at 4096” did not hold, so quote Stage 4 as the FP32 ceiling of this ladder. WMMA **50.2 TFLOPS, 30% of FP16 cuBLAS** vs T4's 10% — same teaching kernel, Ada Tensor Cores are the matching baseline.
+
+`ncu` printed `ERR_NVGPUCTRPERM` on every kernel. Sector counts stay a T4-only measurement. `nsys` is not installed in this image. `-Xptxas -v` and the occupancy API still work: fused v1 is 190 registers, **zero spill**, 16,640 B shared; v2 is 56 registers, zero spill, 18,176 B shared.
 
 ### Per-size (same 4090 session)
 
-`Diff elems` counts elements differing from cuBLAS at all; none of these rows had an element past tolerance.
-
-| Stage | N | Kernel GF/s | cuBLAS GF/s | % cuBLAS | Avg ms | Max abs | Max rel | Diff elems |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Naive | 1024 | 622.21 | 48321 | 1.29 | 3.451 | 0* | 0* | 0* |
-| Naive | 2048 | 682.61 | 55116 | 1.24 | 25.17 | 1.49e-04 | 1.94e-06 | 4043834 |
-| Naive | 4096 | 683.23 | 58826 | 1.16 | 201.16 | 3.36e-04 | 3.03e-06 | 16327639 |
-| Coalesced | 1024 | 5583.70 | 48771 | 11.45 | 0.385 | 0* | 0* | 0* |
-| Coalesced | 2048 | 5620.32 | 55098 | 10.20 | 3.057 | 1.49e-04 | 1.94e-06 | 4043834 |
-| Coalesced | 4096 | 5602.65 | 58736 | 9.54 | 24.53 | 3.36e-04 | 3.03e-06 | 16327639 |
-| Tiled | 1024 | 4803.41 | 48197 | 9.97 | 0.447 | 0* | 0* | 0* |
-| Tiled | 2048 | 4836.05 | 55005 | 8.79 | 3.553 | 1.49e-04 | 1.94e-06 | 4043834 |
-| Tiled | 4096 | 4517.12 | 58749 | 7.69 | 30.43 | 3.36e-04 | 3.03e-06 | 16327639 |
-| Register | 1024 | 30002.17 | 48658 | 61.66 | 0.072 | 0* | 0* | 0* |
-| Register | 2048 | 31353.42 | 55573 | 56.42 | 0.548 | 1.49e-04 | 1.94e-06 | 4043834 |
-| Register | 4096 | 30162.64 | 58757 | 51.33 | 4.557 | 3.36e-04 | 3.03e-06 | 16327639 |
-| Vectorized | 1024 | 27485.61 | 48100 | 57.14 | 0.078 | 0* | 0* | 0* |
-| Vectorized | 2048 | 31993.17 | 57358 | 55.78 | 0.537 | 1.49e-04 | 1.94e-06 | 4043834 |
-| Vectorized | 4096 | 31573.96 | 57885 | 54.55 | 4.353 | 3.36e-04 | 3.03e-06 | 16327639 |
-| WMMA | 1024 | 41364 | 103819 | 39.84 | 0.052 | 1.14e-04 | 2.12e-06 | 1023911 |
-| WMMA | 2048 | 45209 | 152105 | 29.72 | 0.380 | 2.44e-04 | 3.18e-06 | 4150276 |
-| WMMA | 4096 | 46303 | 154185 | 30.03 | 2.968 | 7.86e-04 | 7.10e-06 | 16713183 |
+| Stage | N | Kernel GF/s | cuBLAS GF/s | % cuBLAS | Avg ms | Max abs | Max rel | Diff elems | Fail elems |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Naive | 1024 | 618.25 | 48422.59 | 1.28 | 3.4735 | 0* | 0* | 0 | 0 |
+| Naive | 2048 | 681.70 | 54156.63 | 1.26 | 25.2016 | 1.49e-04 | 1.94e-06 | 4043834 | 0 |
+| Naive | 4096 | 678.97 | 56384.53 | 1.20 | 202.4222 | 3.36e-04 | 3.03e-06 | 16327639 | 0 |
+| Coalesced | 1024 | 5552.43 | 46919.43 | 11.83 | 0.3868 | 0* | 0* | 0 | 0 |
+| Coalesced | 2048 | 5590.35 | 54032.91 | 10.35 | 3.0731 | 1.49e-04 | 1.94e-06 | 4043834 | 0 |
+| Coalesced | 4096 | 5578.42 | 56491.32 | 9.87 | 24.6376 | 3.36e-04 | 3.03e-06 | 16327639 | 0 |
+| Tiled | 1024 | 4776.02 | 46811.43 | 10.20 | 0.4496 | 0* | 0* | 0 | 0 |
+| Tiled | 2048 | 4805.44 | 53928.69 | 8.91 | 3.5751 | 1.49e-04 | 1.94e-06 | 4043834 | 0 |
+| Tiled | 4096 | 4492.91 | 56787.70 | 7.91 | 30.5902 | 3.36e-04 | 3.03e-06 | 16327639 | 0 |
+| Register | 1024 | 29952.63 | 47021.35 | 63.70 | 0.0717 | 0* | 0* | 0 | 0 |
+| Register | 2048 | 31103.48 | 54102.60 | 57.49 | 0.5523 | 1.49e-04 | 1.94e-06 | 4043834 | 0 |
+| Register | 4096 | 31660.35 | 56538.91 | 56.00 | 4.3410 | 3.36e-04 | 3.03e-06 | 16327639 | 0 |
+| Vectorized | 1024 | 28728.11 | 45990.17 | 62.47 | 0.0748 | 0* | 0* | 0 | 0 |
+| Vectorized | 2048 | 32716.88 | 53998.12 | 60.59 | 0.5251 | 1.49e-04 | 1.94e-06 | 4043834 | 0 |
+| Vectorized | 4096 | 30414.17 | 56117.84 | 54.20 | 4.5189 | 3.36e-04 | 3.03e-06 | 16327639 | 0 |
+| WMMA | 1024 | 45000.24 | 112750.11 | 39.91 | 0.0477 | 1.14e-04 | 2.12e-06 | 1023911 | 0 |
+| WMMA | 2048 | 49057.08 | 165798.12 | 29.59 | 0.3502 | 2.44e-04 | 3.18e-06 | 4150276 | 0 |
+| WMMA | 4096 | 50150.48 | 165374.23 | 30.33 | 2.7405 | 7.86e-04 | 7.10e-06 | 16713183 | 0 |
 
 \* Bitwise match against cuBLAS at N=1024 on this binary.
 
-### Attention (4090) — v1, before the rewrite
+### Attention (4090)
 
-| seq | Unfused ms | Fused v1 ms | Speedup | Unfused GF/s | Fused v1 GF/s | Max abs |
-|---:|---:|---:|---:|---:|---:|---:|
-| 256 | 0.128 | 0.339 | **0.38×** | 130.9 | 49.6 | 1.19e-07 |
-| 512 | 0.251 | 0.671 | **0.37×** | 267.1 | 100.1 | 1.42e-07 |
-| 1024 | 0.607 | 1.340 | **0.45×** | 442.1 | 200.3 | 1.15e-07 |
+Occupancy API at seq=1024 (counters denied; these are theoretical):
 
-Fused v1 lost at every sequence length, and lost *harder* here than on the T4. That is the observation that killed the L2 explanation and led to [the grid-size bug](#the-fused-attention-bug-a-grid-too-small-to-fill-the-machine): on a 128-SM GPU, a kernel launching 32 warps has further to fall. v2 numbers go here after the next 4090 session; v1 rows stay for the comparison.
+| Kernel | Regs | Smem B | Thr/blk | Blocks | Warps | Occupancy |
+|---|---:|---:|---:|---:|---:|---:|
+| fused v1 | 190 | 16640 | 32 | 32 | **32** | 10.4% |
+| fused v2 | 56 | 18176 | 128 | 256 | **1024** | 41.7% |
 
-Host-side compare: nothing past tolerance, same ~1e-7 abs as T4.
+| seq | Unfused ms | v1 ms | **v2 ms** | v1 speedup | **v2 speedup** | v2/v1 | Unfused GF/s | **v2 GF/s** | Max abs |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 256 | 0.1186 | 0.3123 | **0.0157** | 0.38× | **7.53×** | 19.8× | 141.5 | **1065** | 1.12e-07 |
+| 512 | 0.2313 | 0.6173 | **0.0282** | 0.37× | **8.21×** | 21.9× | 290.1 | **2382** | 1.34e-07 |
+| 1024 | 0.5575 | 1.2333 | **0.0634** | 0.45× | **8.80×** | 19.5× | 481.5 | **4236** | 1.19e-07 |
 
-### Triton (4090) — TF32, not FP32
+v1 still loses at every sequence length, and loses *harder* than on the T4. That is the observation that killed the L2 explanation: on a 128-SM GPU, 32 warps have further to fall. v2 wins **7.5–8.8×** over unfused at every length, about **20×** over v1. Fail elems = 0.
 
-This run was **not** a fair FP32 comparison, and is kept as the example of how the mistake looks:
+The occupancy API cannot report *achieved* occupancy here the way `ncu` did on T4 (3.12% vs 33.19%). Theoretical occupancy still shows the same 4× gap (10.4% vs 41.7%), and the grid is still 32 warps vs 1024.
 
-| N | Triton ms | torch.matmul ms | Triton GF/s | torch GF/s | % torch | Max abs |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1024 | 0.037 | 0.046 | 58429 | 47211 | 123.8 | 3.95e-02 |
-| 2048 | 0.245 | 0.311 | 70134 | 55225 | 127.0 | 5.66e-02 |
-| 4096 | 1.902 | 2.347 | 72244 | 58568 | 123.4 | 9.12e-02 |
+### Triton (4090)
 
-Do **not** quote "Triton beats cuBLAS." The tell is `max_abs` ~1e-2 against ~1e-4 for the CUDA FP32 stages: on Ada, `tl.dot` on float32 inputs lowers to **TF32 Tensor Cores** by default, which keeps 10 mantissa bits. `triton/matmul.py` now passes `input_precision="ieee"` and sets `torch.backends.cuda.matmul.allow_tf32 = False`, and gates on 1e-4. The TF32 row is still available behind `--tf32`, labelled. Both get re-run on the next 4090 session.
+IEEE FP32 on both sides (`input_precision="ieee"`, `allow_tf32=False`):
+
+| N | Triton ms | torch.matmul ms | Triton GF/s | torch GF/s | % torch | Max abs | Max rel |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 0.0500 | 0.0458 | 42913 | 46889 | 91.5 | 0* | 0* |
+| 2048 | 0.3463 | 0.3127 | 49614 | 54933 | 90.3 | 1.60e-04 | 2.08e-06 |
+| 4096 | 2.7704 | 2.4280 | 49611 | 56606 | **87.6** | 3.89e-04 | 3.24e-06 |
+
+\* Bitwise match at N=1024, same pattern as the C++ harness on this GPU.
+
+This is the fair row. Triton is **87.6% of cuBLAS FP32** at 4096 against Stage 4 CUDA **56.0%**, and max rel is `3.2e-6` — the same order as the CUDA ladder. torch.matmul 56606 GF/s matches the C++ cuBLAS row (56539 on register).
+
+TF32 on both sides (`--tf32`), labelled, **not** comparable to the CUDA FP32 ladder:
+
+| N | Triton ms | torch.matmul ms | Triton GF/s | torch GF/s | % torch | Max abs | Max rel |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 0.0379 | 0.0321 | 56686 | 66803 | 84.9 | 3.90e-02 | 7.34e-04 |
+| 2048 | 0.2512 | 0.2211 | 68400 | 77714 | 88.0 | 6.54e-02 | 8.50e-04 |
+| 4096 | 1.9268 | 1.7073 | 71330 | 80499 | 88.6 | 1.03e-01 | 8.54e-04 |
+
+An earlier 4090 run reported Triton at **123% of torch** with `max_abs ~ 9e-2`. That was TF32 Triton against FP32 torch (torch sat at ~58 TFLOPS, matching the C++ FP32 cuBLAS row). With both sides on TF32, Triton is 88.6% of a 80.5 TFLOPS baseline and the error stays at `1e-1`. Do not quote 123%. The tell that a run is TF32 is the error, not the speedup.
 
 ## Harness rules
 

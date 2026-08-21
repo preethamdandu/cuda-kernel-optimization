@@ -112,6 +112,7 @@ This file tracks dead ends, wrong assumptions, and regressions during kernel opt
 ### Next move
 - Sector counts and achieved occupancy for every kernel now come from Colab, and are in the README under "Measured memory behaviour." RunPod is for the 4090 wall-clock only.
 - Keep the `ncu` block in `run_all.sh` non-fatal so both outcomes get recorded per platform instead of being assumed.
+- The second 4090 session (same image) denied `ncu` again and does not ship `nsys`. CUPTI tracing is not a workaround on this pod. Do not rent another 4090 to retry counters.
 
 ### Lesson
 - A platform limitation is a claim about a specific platform. "It failed here" and "it fails everywhere" needed one more free retry to separate, and that retry produced the strongest evidence in the repo.
@@ -130,7 +131,7 @@ fusedAttentionKernel: 0 bytes stack frame, 0 bytes spill stores, 0 bytes spill l
                       Used 189 registers, 16640 bytes smem
 ```
 
-- `cudaFuncGetAttributes` agrees: `localSizeBytes = 0`. No spill at any point.
+- `cudaFuncGetAttributes` agrees: `localSizeBytes = 0`. No spill at any point. On the 4090 the same kernel compiled to 190 registers, still zero spill.
 
 ### Why it failed
 - The compiler fully unrolled the tile loops and kept all 96 floats in registers, at the cost of 189 registers per thread — high, but under the 255 cap, so no spill was needed.
@@ -199,6 +200,10 @@ fusedAttentionKernel: 0 bytes stack frame, 0 bytes spill stores, 0 bytes spill l
 - 765 GFLOP/s at seq=1024 against unfused's 90.
 - A 10.6× achieved-occupancy gain converted into a 5.7× speedup over v1. v2 pays for its parallelism in shared-memory traffic and two warp-shuffle reductions per tile, so about half the theoretical gain reaches wall-clock. Worth stating as a ratio rather than implying occupancy converts one-for-one.
 
+### Result (4090, measured)
+- v1 still **0.38× / 0.37× / 0.45×**. v2 **7.53× / 8.21× / 8.80×** over unfused, **~20×** over v1, 4236 GFLOP/s at seq=1024.
+- Occupancy API: 32 vs 1024 warps, 10.4% vs 41.7% theoretical. `ncu` denied (`ERR_NVGPUCTRPERM`), so there is no achieved-occupancy number on this GPU. `ptxas`: v1 190 registers, **zero spill**; v2 56 registers, zero spill. Same "no spill" finding as T4.
+
 ## 2026-08-21 — Triton 123% of torch.matmul on 4090 is TF32
 
 ### Attempt
@@ -211,10 +216,11 @@ fusedAttentionKernel: 0 bytes stack frame, 0 bytes spill stores, 0 bytes spill l
 ### Why it failed
 - Root cause: Ada `tl.dot` on float32 tensors uses TF32 Tensor Cores. Not a fair vs cuBLAS FP32. Do not put 123% on a resume.
 
-### Next move
-- Quote the T4 row as the FP32 comparison. If a TF32 row is wanted, set torch and Triton to TF32 explicitly and label it.
-
-### Fix, verified on T4
+### Fix, verified on T4 and 4090
 - `triton/matmul.py` now passes `input_precision="ieee"` to `tl.dot`, sets `torch.backends.cuda.matmul.allow_tf32 = False`, and gates on 1e-4 relative. A `--tf32` flag reports the Tensor Core row separately with the precision printed in the header.
-- On T4 both modes give byte-identical error (7.63e-05 / 1.60e-04) and the same ~78% ratio, which is the correct result: sm_75 has no TF32 path, so the flag is a no-op there. The T4 comparison was always fair; the 4090 one was not.
-- The T4 cannot demonstrate the fix works, only that it does no harm. The real check is re-running the 4090 with `--tf32` off and seeing max abs drop from 9.12e-02 to ~1e-4 with the ratio falling below 100%. Until that run happens, the fix is verified as plumbing, not as an outcome.
+- On T4 both modes give byte-identical error (7.63e-05 / 1.60e-04) and the same ~78% ratio: sm_75 has no TF32 path, so the flag is a no-op. The T4 comparison was always fair.
+- On 4090 IEEE FP32: Triton **87.6%** of torch at 4096, max rel **3.24e-6**, torch 56606 GF/s matching the C++ cuBLAS FP32 row. That is the check the T4 could not provide.
+- On 4090 TF32-vs-TF32: Triton 88.6% of torch at 4096, max abs **1.03e-01**, torch 80499 GF/s. The old 123% was TF32 Triton against FP32 torch. With both sides on TF32 the ratio falls below 100% and the error stays two orders above IEEE.
+
+### Next move
+- Quote 4090 IEEE **87.6%** and T4 IEEE **78.3%** as the FP32 rows. Quote the TF32 row only with the precision labelled. Never quote 123%.
