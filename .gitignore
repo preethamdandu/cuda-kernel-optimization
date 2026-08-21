@@ -1,5 +1,5 @@
-bench
-bench_*
+/bench
+/bench_attn
 *.o
 *.out
 *.ncu-rep

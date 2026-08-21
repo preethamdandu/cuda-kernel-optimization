@@ -98,22 +98,60 @@ Colab `ncu` is expected to print `ERR_NVGPU_PERMISSION` / counters denied. That 
 .
 ├── README.md
 ├── benchmark/
-│   └── bench.cu
+│   ├── bench.cu
+│   └── bench_attn.cu
 ├── notebooks/
-│   └── colab_week1.ipynb
+│   ├── colab_week1.ipynb
+│   ├── colab_week2.ipynb
+│   └── colab_week4.ipynb
 ├── notes/
 │   └── what_failed.md
 ├── profiles/
-└── src/
-    ├── 01_naive.cu
-    ├── 02_coalesced.cu
-    ├── 03_tiled.cu
-    ├── 04_register_blocked.cu
-    ├── 05_vectorized.cu
-    ├── 06_wmma_tensorcore.cu
-    ├── stage_registry.cu
-    └── stage_registry.cuh
+├── src/
+│   ├── 01_naive.cu
+│   ├── 02_coalesced.cu
+│   ├── 03_tiled.cu
+│   ├── 04_register_blocked.cu
+│   ├── 05_vectorized.cu
+│   ├── 06_wmma_tensorcore.cu
+│   ├── 07_attention_unfused.cu
+│   ├── 08_attention_fused.cu
+│   ├── attn.cuh
+│   ├── stage_registry.cu
+│   └── stage_registry.cuh
+└── triton/
+    └── matmul.py
 ```
+
+## Week 4 — Fused vs unfused attention (Tesla T4)
+
+Single-head SDPA, `head_dim=64`, batch=1. Unfused is three kernels with a `seq×seq` score matrix in global memory. Fused is one kernel with online softmax (FlashAttention recurrence) and 32×64 K/V tiles in shared memory. Sequence length capped at 1024.
+
+FLOPs counted as `4·seq·seq·d` (QKᵀ + PV). Softmax is extra work, not in the GFLOP/s numerator.
+
+| seq | Unfused ms | Fused ms | Speedup | Unfused GF/s | Fused GF/s | S tile MiB | Notes |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 256 | — | — | — | — | — | 0.25 | awaiting Colab |
+| 512 | — | — | — | — | — | 1.00 | awaiting Colab |
+| 1024 | — | — | — | — | — | 4.00 | awaiting Colab |
+
+PyTorch `F.scaled_dot_product_attention` (MATH and MEM_EFFICIENT backends) and a Triton tiled SGEMM vs `torch.matmul` will be added from the same session. T4 is sm_75; the FlashAttention CUDA backend in PyTorch is typically sm_80+, so MATH/EFFICIENT are the fair refs, not “we beat FlashAttention.”
+
+Open [`notebooks/colab_week4.ipynb`](notebooks/colab_week4.ipynb). Do not rerun the Week 1 naive 4096 cell.
+
+```bash
+cd cuda-kernel-optimization
+ARCH=sm_$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.' | tr -d ' ')
+nvcc -O3 -arch=$ARCH -lineinfo \
+  benchmark/bench_attn.cu src/07_attention_unfused.cu src/08_attention_fused.cu \
+  -o bench_attn
+./bench_attn --seqs 256 512 1024
+python3 triton/matmul.py --sizes 1024 2048 4096
+```
+
+### CUDA vs Triton (SGEMM)
+
+Triton tiled matmul is the official blocked-GEMM shape (64×64×32 tiles, `tl.dot`) in `triton/matmul.py`. Numbers pending Colab. The point of the row is not to beat Stage 5: Triton is a few dozen lines and a compiler does the shared-memory/register mapping; the CUDA ladder is the control you give up. Quote `% torch.matmul` once the table is filled — that is the same cuBLAS baseline as the C++ harness, not a comparison against Stage 5 wall-clock from a different process.
 
 ## Harness rules
 
@@ -121,11 +159,13 @@ Colab `ncu` is expected to print `ERR_NVGPU_PERMISSION` / counters denied. That 
 - `cudaEvent` timing: 3 warmup + 10 timed; mean excludes warmup. cuBLAS uses the same harness.
 - GFLOP/s = `2·M·N·K / (ms · 1e6)` with the product in `double`.
 - Seed A with 42 and B with 43 so square A and B differ, but runs stay deterministic.
-- `src/*.cu` must link: `getRegisteredStages()` lives only in `stage_registry.cu`. Stages 3–6 are comment-only TUs.
+- `getRegisteredStages()` lives only in `stage_registry.cu`. Attention is a separate binary (`bench_attn`), not a GEMM `--stage`.
 
 ## Run on Colab
 
 Open [`notebooks/colab_week1.ipynb`](notebooks/colab_week1.ipynb). **Runtime → Change runtime type → Hardware accelerator = T4 GPU**, then **Runtime → Run all**. A CPU runtime has no `nvidia-smi` and no `nvcc`; that is the `command not found` / `sm_` error. Changing the accelerator reconnects you to a new VM, so clone again after the switch.
+
+Week 4 attention + Triton: [`notebooks/colab_week4.ipynb`](notebooks/colab_week4.ipynb).
 
 Then:
 
