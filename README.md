@@ -18,6 +18,8 @@ SGEMM optimization ladder from an honest uncoalesced baseline through coalescing
 
 Week 4 (same T4): fused attention wins only at seq=1024 (**1.47×** unfused); it **loses** at 256/512. Triton SGEMM is **80.8%** of `torch.matmul` at 4096 vs Stage 5 CUDA **55.6%** of cuBLAS. Details below.
 
+Same kernels on an **RTX 4090** (RunPod, sm_89, separate session): [RTX 4090 section](#rtx-4090-runpod-2026-08-21). Do not mix T4 and 4090 rows.
+
 The only difference between these two kernels is which thread index drives the row. (For square M=N=K — the sizes in this table — the two grid expressions evaluate to identical `dim3` values; they would differ for non-square.)
 
 Both kernels use `dim3 block(32, 32)`. Coalesced / naive at 4096 is **9.4×** (580.13 / 61.73). That is a bit above the 5–8× rule of thumb because Stage 1 is a *true* uncoalesced mapping, not the accidentally-coalesced kernel that used to sit in `01_naive.cu`.
@@ -42,7 +44,7 @@ Same 2048 error on tiled, register, and vectorized as Stages 1–2 (`1.53e-04` /
 
 cuBLAS 41.5 TFLOPS at 4096 is ~64% of T4 FP16 Tensor Core peak (~65 TFLOPS). That baseline is healthy. The WMMA kernel is **4.2 TFLOPS, ~10% of that cuBLAS**, about **1.8×** Stage 5's FP32 2.37 TFLOPS. This is a teaching WMMA (no async copy, no double-buffer, 64×64 tile), not 60–80% of cuBLAS FP16. Do not inflate it.
 
-Correctness printed 0 mismatches at 1024, 2048, and 4096 with `max|ref|` 54 / 77 / 111. FP32 stages at 1024/2048 had ~1e6 / ~4e6 mismatches. Either WMMA matches `cublasGemmEx` bitwise (possible if both hit the same MMA) or the compare loop is still lying. Error column is **unverified** until `./bench --stage vectorized --sizes 1024` still shows ~1e6 mismatches on this binary. See [notes/what_failed.md](notes/what_failed.md).
+Correctness printed 0 mismatches at 1024, 2048, and 4096 with `max|ref|` 54 / 77 / 111. FP32 stages at 1024/2048 had ~1e6 / ~4e6 mismatches. Either WMMA matches `cublasGemmEx` bitwise (possible if both hit the same MMA) or the compare loop is still lying. Error column on T4 is **unverified**. The same WMMA kernel on the 4090 reports ~1e6 / ~4e6 / ~17e6 mismatches — the checker can see diffs; the T4 zeros are still not a pass. See [notes/what_failed.md](notes/what_failed.md).
 
 Req GB/s in the harness still uses the no-reuse formula `(2MNK+MN)×4`. That number is meaningful vs peak for Stages 1–2. From Stage 3 on it is an upper bound, not DRAM traffic. Stage 6 uses 2-byte A/B in that formula.
 
@@ -84,15 +86,13 @@ Arithmetic is identical: one thread, one `C[i,j]`, K FMAs from global memory.
 - Naive sits at ~247 GB/s **below** peak. The kernel is latency-bound on uncoalesced 32-sector transactions, so wall-clock stretches and bytes/time look small.
 - Coalesced sits at ~2320 GB/s, about **7×** peak. That is L1/L2 answering reuse the kernel does not express (each A row is reread across columns; each B column is reread across rows). Not a measurement bug.
 
-## Week 3 ncu (expected, not measured)
+## Week 3 ncu (measured: counters denied)
 
-On a machine where Nsight Compute counters are allowed (rented 4090, not Colab):
+Ran `ncu` on Colab T4 (expected deny) and on RunPod RTX 4090 as root with Nsight Compute 2025.1.1. Both printed:
 
-- Kernel-average sectors/request ~16.5 (naive) vs ~2.5 (coalesced)
-- The 32-vs-4 contrast lives in the A-load instruction specifically
-- C store: 32 vs 4 sectors, collected via `op_st`
+`ERR_NVGPUCTRPERM - The user does not have permission to access NVIDIA GPU Performance Counters`
 
-Colab `ncu` is expected to print `ERR_NVGPU_PERMISSION` / counters denied. That is a platform wall, not a kernel bug.
+No `.ncu-rep` files. Sectors/request is **not measured**. Expected contrast if a privileged host ever allows counters: ~16.5 vs ~2.5 kernel-average; 32 vs 4 on the A-load and C-store. Logged in [notes/what_failed.md](notes/what_failed.md). This is a platform wall, not a kernel bug.
 
 ## Project layout
 
@@ -162,6 +162,71 @@ Triton tiled matmul (`triton/matmul.py`, 64×64×32, `tl.dot`) vs `torch.matmul`
 | 4096 | 39.93 | 32.25 | 3442 | 4262 | 80.8 | 0* |
 
 \* Same exact-zero pattern as the C++ checker at N=4096. Quote 2048 error. torch.matmul 4262 GF/s matches the C++ cuBLAS row (~4253 on vectorized). Triton is **~81% of cuBLAS** at 4096 vs Stage 5 CUDA **55.6%**. ~80 lines of Python beat the five-stage FP32 ladder (3442 vs 2365 GF/s). That is the productivity-vs-control point: Triton won on this GPU; the CUDA ladder is how you see *why*. `tl.dot` here is FP32, not Tensor Cores — do not mix this 81% with Stage 6's 10% of FP16 cuBLAS.
+
+## RTX 4090 (RunPod, 2026-08-21)
+
+Same binaries, compiled `-arch=sm_89`. **GPU:** NVIDIA GeForce RTX 4090, 128 SMs, sm_89. Peak DRAM 1008.10 GB/s (mem clock 10501 MHz, 384-bit bus). Headline numbers are N=4096. **Do not put these in the T4 table.**
+
+| Stage | Kernel | Precision | GFLOP/s | % cuBLAS | Req GB/s | Max abs err | Max rel err | Notes |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| 1 | Naive (uncoalesced) | FP32 | 683.23 | 1.16 | 2733 | 3.36e-04† | 3.03e-06† | `threadIdx.x` → row |
+| 2 | Coalesced | FP32 | 5602.65 | 9.54 | 22413 | 3.36e-04† | 3.03e-06† | **8.2×** naive |
+| 3 | Shared-memory tiled | FP32 | 4517.12 | 7.69 | 18071 | 3.36e-04† | 3.03e-06† | **lost** to Stage 2 at every size |
+| 4 | Register blocked | FP32 | 30162.64 | 51.33 | 120665 | 3.36e-04† | 3.03e-06† | **5.4×** coalesced |
+| 5 | Vectorized loads | FP32 | 31573.96 | 54.55 | 126311 | 3.36e-04† | 3.03e-06† | **+4.7%** over Stage 4 |
+| 6 | WMMA / Tensor Cores | FP16→FP32 | 46303 | 30.0‡ | 92628 | 7.86e-04† | 7.10e-06† | vs cuBLAS **FP16**, not FP32 |
+
+† FP32/WMMA error quoted from N=4096. N=1024 FP32 printed exact-zero (inverted from T4, where 4096 was the zero). WMMA has real mismatches at 1024/2048/4096.  
+‡ Stage 6 `% cuBLAS` is vs `cublasGemmEx` FP16 (~154 TFLOPS at 4096), **not** vs FP32 cuBLAS (~58.8 TFLOPS). Do not put 30% and 55% in the same sentence.
+
+cuBLAS FP32 ~58.8 TFLOPS is a healthy 4090 baseline. Coalesced/naive is **8.2×** (5603 / 683). Tiling lost everywhere (4517 vs 5603 at 4096) — stronger miss than T4. Register blocking is still the real jump. Vectorized *lost* at N=1024 vs register (27486 vs 30002) and won by 4.7% at 4096. WMMA **46.3 TFLOPS, 30% of FP16 cuBLAS** vs T4's 10% — same teaching kernel, Ada Tensor Cores are the matching baseline.
+
+### Per-size (same 4090 session)
+
+| Stage | N | Kernel GF/s | cuBLAS GF/s | % cuBLAS | Avg ms | Max abs | Max rel | Mismatches |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Naive | 1024 | 622.21 | 48321 | 1.29 | 3.451 | 0* | 0* | 0* |
+| Naive | 2048 | 682.61 | 55116 | 1.24 | 25.17 | 1.49e-04 | 1.94e-06 | 4043834 |
+| Naive | 4096 | 683.23 | 58826 | 1.16 | 201.16 | 3.36e-04 | 3.03e-06 | 16327639 |
+| Coalesced | 1024 | 5583.70 | 48771 | 11.45 | 0.385 | 0* | 0* | 0* |
+| Coalesced | 2048 | 5620.32 | 55098 | 10.20 | 3.057 | 1.49e-04 | 1.94e-06 | 4043834 |
+| Coalesced | 4096 | 5602.65 | 58736 | 9.54 | 24.53 | 3.36e-04 | 3.03e-06 | 16327639 |
+| Tiled | 1024 | 4803.41 | 48197 | 9.97 | 0.447 | 0* | 0* | 0* |
+| Tiled | 2048 | 4836.05 | 55005 | 8.79 | 3.553 | 1.49e-04 | 1.94e-06 | 4043834 |
+| Tiled | 4096 | 4517.12 | 58749 | 7.69 | 30.43 | 3.36e-04 | 3.03e-06 | 16327639 |
+| Register | 1024 | 30002.17 | 48658 | 61.66 | 0.072 | 0* | 0* | 0* |
+| Register | 2048 | 31353.42 | 55573 | 56.42 | 0.548 | 1.49e-04 | 1.94e-06 | 4043834 |
+| Register | 4096 | 30162.64 | 58757 | 51.33 | 4.557 | 3.36e-04 | 3.03e-06 | 16327639 |
+| Vectorized | 1024 | 27485.61 | 48100 | 57.14 | 0.078 | 0* | 0* | 0* |
+| Vectorized | 2048 | 31993.17 | 57358 | 55.78 | 0.537 | 1.49e-04 | 1.94e-06 | 4043834 |
+| Vectorized | 4096 | 31573.96 | 57885 | 54.55 | 4.353 | 3.36e-04 | 3.03e-06 | 16327639 |
+| WMMA | 1024 | 41364 | 103819 | 39.84 | 0.052 | 1.14e-04 | 2.12e-06 | 1023911 |
+| WMMA | 2048 | 45209 | 152105 | 29.72 | 0.380 | 2.44e-04 | 3.18e-06 | 4150276 |
+| WMMA | 4096 | 46303 | 154185 | 30.03 | 2.968 | 7.86e-04 | 7.10e-06 | 16713183 |
+
+\* Do not quote N=1024 FP32 error on this 4090 binary.
+
+### Attention (4090)
+
+Fused **lost at every seq**. 4090 L2 is 72 MiB; the 4 MiB score matrix never spills. The T4 1.47× win at 1024 does not carry over.
+
+| seq | Unfused ms | Fused ms | Speedup | Unfused GF/s | Fused GF/s | Max abs |
+|---:|---:|---:|---:|---:|---:|---:|
+| 256 | 0.128 | 0.339 | **0.38×** | 130.9 | 49.6 | 1.19e-07 |
+| 512 | 0.251 | 0.671 | **0.37×** | 267.1 | 100.1 | 1.42e-07 |
+| 1024 | 0.607 | 1.340 | **0.45×** | 442.1 | 200.3 | 1.15e-07 |
+
+Host-side compare: 0 mismatches, same ~1e-7 abs as T4.
+
+### Triton (4090) — TF32, not FP32
+
+| N | Triton ms | torch.matmul ms | Triton GF/s | torch GF/s | % torch | Max abs |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 0.037 | 0.046 | 58429 | 47211 | 123.8 | 3.95e-02 |
+| 2048 | 0.245 | 0.311 | 70134 | 55225 | 127.0 | 5.66e-02 |
+| 4096 | 1.902 | 2.347 | 72244 | 58568 | 123.4 | 9.12e-02 |
+
+Do **not** quote “Triton beats cuBLAS.” `max_abs` is ~1e-2 vs CUDA FP32 ~1e-4. On Ada, `tl.dot` in float32 uses **TF32 Tensor Cores**. torch.matmul 58568 GF/s matches the C++ FP32 cuBLAS row (~57885). Different math. T4 Triton 81% is the fair FP32 comparison (T4 has no TF32).
 
 ## Harness rules
 

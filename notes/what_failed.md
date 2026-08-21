@@ -79,18 +79,63 @@ This file tracks dead ends, wrong assumptions, and regressions during kernel opt
 ### Next move
 - Leave the teaching kernel. The interview point is the crossover, not a 1.47× headline. Do not retune tiles to manufacture a win at 256. Optional later: PyTorch SDPA MATH/EFFICIENT on the same T4 (sm_75 has no FlashAttention CUDA backend).
 
-## Planned — Colab ncu permission wall
+## 2026-08-21 — ncu ERR_NVGPUCTRPERM on Colab T4 and RunPod 4090
 
 ### Attempt
-- Stage: profiling (Week 3)
-- Change tried: Run `ncu --metrics l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,...` on Colab T4 from `notebooks/colab_week1.ipynb`.
+- Stage: Week 3 profiling.
+- Change tried: `ncu --metrics l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,... --kernel-name regex:naiveSgemmKernel --launch-count 1` (and coalesced / register) as **root** on RunPod RTX 4090, Nsight Compute 2025.1.1, CUDA 12.8. Same metrics on Colab T4 earlier.
 
 ### What happened
-- Symptom: expected `ERR_NVGPU_PERMISSION` / counters denied. Colab does not expose the privileged counters Nsight Compute needs.
-- Evidence: not measured yet; this is a planned dead-end, not a surprise.
+- Symptom: `==ERROR== ERR_NVGPUCTRPERM - The user does not have permission to access NVIDIA GPU Performance Counters on the target device 0.`
+- Evidence: no `profiles/*.ncu-rep` files (`Could not open report file`). Bench still printed GFLOP/s; only counters were denied. RunPod image: `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`.
 
 ### Why it failed
-- Root cause: Colab's NVIDIA driver/container blocks ncu hardware counters. This is a platform restriction, not a kernel bug.
+- Root cause: the NVIDIA driver in the container/hypervisor has profiling restricted (`RmProfilingAdminOnly` / guest counter policy). Root inside the pod is not host privilege. Same class of wall as Colab, not a bad `ncu` flag.
 
 ### Next move
-- Log the Colab failure, then collect sectors/request on a rented RTX 4090 in Week 3. Expected contrast (not measured here): kernel-average ~16.5 vs ~2.5 sectors/request; 32 vs 4 on the A-load instruction; C store 32 vs 4 via `op_st`.
+- Do not rent another 4090 for the same command. Sectors/request needs a **privileged** VM or host `NVreg_RestrictProfiling=0`. Until then the coalescing claim is the 8.2× wall-clock (4090) / 9.4× (T4), not ncu.
+
+## 2026-08-21 — 32×32 tiling lost to coalesced at every size on 4090
+
+### Attempt
+- Stage: 3 vs 2 on RunPod RTX 4090.
+
+### What happened
+- Symptom: tiled was slower than coalesced at 1024 (4803 vs 5584), 2048 (4836 vs 5620), and 4096 (4517 vs 5603). T4 had a 1.25× win at 4096; that vanished.
+- Evidence: same error as coalesced at 2048/4096 (same math).
+
+### Why it failed
+- Root cause: same teaching tile as T4. 4090's larger L2 makes the no-shared coalesced kernel even harder to beat without register blocking.
+
+### Next move
+- Leave Stage 3. Quote the 4090 loss; do not retune.
+
+## 2026-08-21 — Fused attention lost at every seq on 4090
+
+### Attempt
+- Stage: fused vs unfused SDPA on RTX 4090 (`head_dim=64`).
+
+### What happened
+- Symptom: speedup **0.38× / 0.37× / 0.45×** at 256 / 512 / 1024. T4's 1.47× at 1024 did not repeat.
+- Evidence: host-side abs error ~1e-7, 0 mismatches (same as T4).
+
+### Why it failed
+- Root cause: 4090 L2 is 72 MiB. Unfused scores are at most 4 MiB. Fusion never avoids a DRAM round-trip.
+
+### Next move
+- The interview point is the T4 crossover vs 4090 non-crossover, not a fused-always-wins headline.
+
+## 2026-08-21 — Triton 123% of torch.matmul on 4090 is TF32
+
+### Attempt
+- Stage: `triton/matmul.py` vs `torch.matmul` on 4090.
+
+### What happened
+- Symptom: Triton 72244 vs torch 58568 GFLOP/s at 4096 (**123.4%**). Max abs **9.12e-02**. CUDA FP32 stages were ~3e-4 abs.
+- Evidence: T4 Triton max abs was 7.6e-05 / 1.6e-04 (real FP32). 4090 error is two orders larger.
+
+### Why it failed
+- Root cause: Ada `tl.dot` on float32 tensors uses TF32 Tensor Cores. Not a fair vs cuBLAS FP32. Do not put 123% on a resume.
+
+### Next move
+- Quote T4 Triton **80.8% of torch.matmul** as the FP32 row. If a TF32 row is wanted later, set torch and Triton to TF32 explicitly and label it.
