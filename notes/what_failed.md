@@ -63,6 +63,22 @@ This file tracks dead ends, wrong assumptions, and regressions during kernel opt
 ### Next move
 - Leave Stage 3 as the teaching kernel. Do not retune it to beat Stage 2. Stage 4 (4×4 per thread) is the actual 3.8× jump.
 
+## 2026-08-21 — Fused attention lost at seq=256 and 512
+
+### Attempt
+- Stage: Week 4 fused vs unfused SDPA on Colab T4 (`head_dim=64`).
+- Change tried: one kernel, online softmax, 32×64 K/V tiles in smem, vs three kernels that materialize `seq×seq` scores.
+
+### What happened
+- Symptom: fused was **0.67×** unfused at 256 (0.829 vs 0.555 ms) and **0.93×** at 512. Only **1.47×** at 1024 (3.328 vs 4.894 ms).
+- Evidence: host-side compare passed at all sizes (max abs ~1e-7, 0 mismatches). Timing is real.
+
+### Why it failed
+- Root cause: T4 L2 is 4 MiB. Unfused scores are 0.25 / 1.00 / 4.00 MiB. Fusion avoids a write that L2 was already covering, and pays `__syncthreads()` + running softmax state. Same shape as Stage 3 tiling losing at N=1024.
+
+### Next move
+- Leave the teaching kernel. The interview point is the crossover, not a 1.47× headline. Do not retune tiles to manufacture a win at 256. Optional later: PyTorch SDPA MATH/EFFICIENT on the same T4 (sm_75 has no FlashAttention CUDA backend).
+
 ## Planned — Colab ncu permission wall
 
 ### Attempt

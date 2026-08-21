@@ -16,6 +16,8 @@ SGEMM optimization ladder from an honest uncoalesced baseline through coalescing
 † Error quoted from N=2048 FP32 stages. N=4096 FP32 error is not quoted.  
 ‡ Stage 6 `% cuBLAS` is vs `cublasGemmEx` FP16 Tensor Cores (~41.5 TFLOPS at 4096), **not** vs FP32 cuBLAS (~4.2 TFLOPS). Do not put 10% and 55% in the same sentence.
 
+Week 4 (same T4): fused attention wins only at seq=1024 (**1.47×** unfused); it **loses** at 256/512. Triton SGEMM is **80.8%** of `torch.matmul` at 4096 vs Stage 5 CUDA **55.6%** of cuBLAS. Details below.
+
 The only difference between these two kernels is which thread index drives the row. (For square M=N=K — the sizes in this table — the two grid expressions evaluate to identical `dim3` values; they would differ for non-square.)
 
 Both kernels use `dim3 block(32, 32)`. Coalesced / naive at 4096 is **9.4×** (580.13 / 61.73). That is a bit above the 5–8× rule of thumb because Stage 1 is a *true* uncoalesced mapping, not the accidentally-coalesced kernel that used to sit in `01_naive.cu`.
@@ -127,17 +129,17 @@ Colab `ncu` is expected to print `ERR_NVGPU_PERMISSION` / counters denied. That 
 
 Single-head SDPA, `head_dim=64`, batch=1. Unfused is three kernels with a `seq×seq` score matrix in global memory. Fused is one kernel with online softmax (FlashAttention recurrence) and 32×64 K/V tiles in shared memory. Sequence length capped at 1024.
 
-FLOPs counted as `4·seq·seq·d` (QKᵀ + PV). Softmax is extra work, not in the GFLOP/s numerator.
+FLOPs counted as `4·seq·seq·d` (QKᵀ + PV). Softmax is extra work, not in the GFLOP/s numerator. Host-side fused vs unfused compare (not the GEMM device checker).
 
-| seq | Unfused ms | Fused ms | Speedup | Unfused GF/s | Fused GF/s | S tile MiB | Notes |
-|---:|---:|---:|---:|---:|---:|---:|---|
-| 256 | — | — | — | — | — | 0.25 | awaiting Colab |
-| 512 | — | — | — | — | — | 1.00 | awaiting Colab |
-| 1024 | — | — | — | — | — | 4.00 | awaiting Colab |
+| seq | Unfused ms | Fused ms | Speedup | Unfused GF/s | Fused GF/s | S MiB | Max abs | Max rel |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 256 | 0.555 | 0.829 | **0.67×** | 30.2 | 20.2 | 0.25 | 1.19e-07 | 9.59e-07 |
+| 512 | 1.523 | 1.639 | **0.93×** | 44.1 | 41.0 | 1.00 | 1.42e-07 | 1.48e-06 |
+| 1024 | 4.894 | 3.328 | **1.47×** | 54.9 | 80.7 | 4.00 | 1.15e-07 | 1.97e-06 |
 
-PyTorch `F.scaled_dot_product_attention` (MATH and MEM_EFFICIENT backends) and a Triton tiled SGEMM vs `torch.matmul` will be added from the same session. T4 is sm_75; the FlashAttention CUDA backend in PyTorch is typically sm_80+, so MATH/EFFICIENT are the fair refs, not “we beat FlashAttention.”
+Fusion **lost** at 256 and 512. It only wins at 1024. T4 L2 is 4 MiB; the unfused score matrix is 0.25 / 1.00 / 4.00 MiB. Below L2 the extra `__syncthreads()` and online-softmax state are pure overhead. At 1024 the `seq×seq` working set equals L2, so not writing it starts to pay. Same lesson as Stage 3 tiling losing at N=1024. Logged in [notes/what_failed.md](notes/what_failed.md).
 
-Open [`notebooks/colab_week4.ipynb`](notebooks/colab_week4.ipynb). Do not rerun the Week 1 naive 4096 cell.
+Zero mismatches at all three sizes, abs error ~1e-7. That is a real host copy, not the N=4096 GEMM checker. Do not call this FlashAttention: 80 GFLOP/s is a teaching kernel (one thread per Q row). PyTorch SDPA was not run in this session.
 
 ```bash
 cd cuda-kernel-optimization
@@ -149,9 +151,17 @@ nvcc -O3 -arch=$ARCH -lineinfo \
 python3 triton/matmul.py --sizes 1024 2048 4096
 ```
 
-### CUDA vs Triton (SGEMM)
+### CUDA vs Triton (SGEMM, same T4 session)
 
-Triton tiled matmul is the official blocked-GEMM shape (64×64×32 tiles, `tl.dot`) in `triton/matmul.py`. Numbers pending Colab. The point of the row is not to beat Stage 5: Triton is a few dozen lines and a compiler does the shared-memory/register mapping; the CUDA ladder is the control you give up. Quote `% torch.matmul` once the table is filled — that is the same cuBLAS baseline as the C++ harness, not a comparison against Stage 5 wall-clock from a different process.
+Triton tiled matmul (`triton/matmul.py`, 64×64×32, `tl.dot`) vs `torch.matmul` (cuBLAS). Same 2N³ GFLOP formula as the C++ harness.
+
+| N | Triton ms | torch.matmul ms | Triton GF/s | torch GF/s | % torch | Max abs |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 0.675 | 0.523 | 3181 | 4105 | 77.5 | 7.63e-05 |
+| 2048 | 4.743 | 3.888 | 3622 | 4419 | 82.0 | 1.60e-04 |
+| 4096 | 39.93 | 32.25 | 3442 | 4262 | 80.8 | 0* |
+
+\* Same exact-zero pattern as the C++ checker at N=4096. Quote 2048 error. torch.matmul 4262 GF/s matches the C++ cuBLAS row (~4253 on vectorized). Triton is **~81% of cuBLAS** at 4096 vs Stage 5 CUDA **55.6%**. ~80 lines of Python beat the five-stage FP32 ladder (3442 vs 2365 GF/s). That is the productivity-vs-control point: Triton won on this GPU; the CUDA ladder is how you see *why*. `tl.dot` here is FP32, not Tensor Cores — do not mix this 81% with Stage 6's 10% of FP16 cuBLAS.
 
 ## Harness rules
 
