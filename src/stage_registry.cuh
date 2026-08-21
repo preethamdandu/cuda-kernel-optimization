@@ -14,5 +14,8 @@ struct StageDefinition {
 
 void launchNaiveSgemm(const float* a, const float* b, float* c, int m, int n, int k);
 void launchCoalescedSgemm(const float* a, const float* b, float* c, int m, int n, int k);
+void launchTiledSgemm(const float* a, const float* b, float* c, int m, int n, int k);
+void launchRegisterBlockedSgemm(const float* a, const float* b, float* c, int m, int n, int k);
+void launchVectorizedSgemm(const float* a, const float* b, float* c, int m, int n, int k);
 
 std::vector<StageDefinition> getRegisteredStages();

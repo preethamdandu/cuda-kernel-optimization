@@ -19,6 +19,22 @@ The only difference between these two kernels is which thread index drives the r
 
 Both kernels use `dim3 block(32, 32)`. Coalesced / naive at 4096 is **9.4×** (580.13 / 61.73). That is a bit above the 5–8× rule of thumb because Stage 1 is a *true* uncoalesced mapping, not the accidentally-coalesced kernel that used to sit in `01_naive.cu`.
 
+## Stages 3–5 (code in, numbers next Colab run)
+
+- **Stage 3 `tiled`:** 32×32 shared A/B tiles, pad +1 column, two `__syncthreads()`. Same output mapping as Stage 2. Expect ~2–3× over coalesced if reuse lands.
+- **Stage 4 `register`:** 64×64 block tile, 16×16 threads, each thread a 4×4 register patch, K-panel 16. Biggest conceptual jump.
+- **Stage 5 `vectorized`:** Stage 4 plus `float4` global→shared. Modest 10–30% if the extra bandwidth is the limiter.
+
+Req GB/s in the harness still uses the no-reuse formula `(2MNK+MN)×4`. That number is meaningful vs peak for Stages 1–2. From Stage 3 on it is an upper bound, not DRAM traffic.
+
+Do not fill TBD cells from memory. Paste Colab tables. Skip `--stage naive` this round; 4096 naive is ~2.2 s/iter.
+
+```bash
+./bench --stage tiled --sizes 1024 2048 4096
+./bench --stage register --sizes 1024 2048 4096
+./bench --stage vectorized --sizes 1024 2048 4096
+```
+
 ### Per-size (same T4 session)
 
 | Stage | N | Kernel GF/s | cuBLAS GF/s | % cuBLAS | Req GB/s | Peak DRAM | Max abs | Max rel |

@@ -16,5 +16,26 @@ std::vector<StageDefinition> getRegisteredStages() {
           1.0e-4f,
           launchCoalescedSgemm,
       },
+      {
+          "tiled",
+          "Shared-memory tiled SGEMM: 32x32 A/B tiles reused across a 32x32 C tile.",
+          false,
+          1.0e-4f,
+          launchTiledSgemm,
+      },
+      {
+          "register",
+          "Register-blocked SGEMM: 64x64 block tile, each thread owns a 4x4 C patch.",
+          false,
+          1.0e-4f,
+          launchRegisterBlockedSgemm,
+      },
+      {
+          "vectorized",
+          "Register-blocked SGEMM with float4 global-to-shared loads.",
+          false,
+          1.0e-4f,
+          launchVectorizedSgemm,
+      },
   };
 }

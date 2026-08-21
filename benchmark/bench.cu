@@ -378,7 +378,8 @@ void printDeviceHeader() {
 }
 
 void printUsage() {
-  std::cout << "Usage: ./bench [--stage naive|coalesced] [--sizes 1024 2048 4096]\n";
+  std::cout << "Usage: ./bench [--stage naive|coalesced|tiled|register|vectorized] "
+               "[--sizes 1024 2048 4096]\n";
 }
 
 }  // namespace
