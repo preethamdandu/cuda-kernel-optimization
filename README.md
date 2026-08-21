@@ -8,9 +8,9 @@ SGEMM optimization ladder from an honest uncoalesced baseline through coalescing
 |---|---|---|---:|---:|---:|---:|---:|---|
 | 1 | Naive (uncoalesced) | FP32 | 61.73 | 1.48 | 247 | 1.53e-04† | 1.99e-06† | `threadIdx.x` → row |
 | 2 | Coalesced | FP32 | 580.13 | 13.89 | 2321 | 1.53e-04† | 1.99e-06† | `threadIdx.x` → col |
-| 3 | Shared-memory tiled | FP32 | TBD | TBD | TBD | TBD | TBD | Reuse A/B tiles in shared memory |
-| 4 | Register blocked | FP32 | TBD | TBD | TBD | TBD | TBD | Each thread owns a small C tile |
-| 5 | Vectorized loads | FP32 | TBD | TBD | TBD | TBD | TBD | Wider transfers such as `float4` |
+| 3 | Shared-memory tiled | FP32 | 725.61 | 16.80 | 2903 | 1.53e-04† | 1.99e-06† | 32×32 tiles; only 1.25× Stage 2 |
+| 4 | Register blocked | FP32 | 2202.43 | 51.52 | 8811 | 1.53e-04† | 1.99e-06† | 64×64 block, 4×4 per thread |
+| 5 | Vectorized loads | FP32 | 2364.88 | 55.60 | 9461 | 1.53e-04† | 1.99e-06† | float4; +7% over Stage 4 |
 | 6 | WMMA / Tensor Cores | FP16→FP32 | TBD | TBD | TBD | TBD | TBD | Compare against cuBLAS FP16 |
 
 † Error quoted from N=2048. Both stages printed identical error there (same arithmetic). N=4096 printed `0.000e+00` for both abs and rel — that is not believable for a length-4096 FP32 dot product, so it is not in this table. See [notes/what_failed.md](notes/what_failed.md).
@@ -19,21 +19,15 @@ The only difference between these two kernels is which thread index drives the r
 
 Both kernels use `dim3 block(32, 32)`. Coalesced / naive at 4096 is **9.4×** (580.13 / 61.73). That is a bit above the 5–8× rule of thumb because Stage 1 is a *true* uncoalesced mapping, not the accidentally-coalesced kernel that used to sit in `01_naive.cu`.
 
-## Stages 3–5 (code in, numbers next Colab run)
+## Stages 3–5 (Tesla T4, N=4096)
 
-- **Stage 3 `tiled`:** 32×32 shared A/B tiles, pad +1 column, two `__syncthreads()`. Same output mapping as Stage 2. Expect ~2–3× over coalesced if reuse lands.
-- **Stage 4 `register`:** 64×64 block tile, 16×16 threads, each thread a 4×4 register patch, K-panel 16. Biggest conceptual jump.
-- **Stage 5 `vectorized`:** Stage 4 plus `float4` global→shared. Modest 10–30% if the extra bandwidth is the limiter.
+- **Stage 3 `tiled`:** 725.61 GFLOP/s, **16.8%** of cuBLAS. Only **1.25×** coalesced, not the 2–3× textbook jump. At N=1024 it *lost* (365 vs 623) — working set already in L2, `__syncthreads()` is extra cost. Logged in [notes/what_failed.md](notes/what_failed.md). Left as the teaching kernel; did not tune it to chase Stage 2.
+- **Stage 4 `register`:** 2202 GFLOP/s, **51.5%** of cuBLAS. **3.0×** tiled, **3.8×** coalesced. This is the real reuse jump: each thread holds a 4×4 C patch, each shared value feeds 16 FMAs.
+- **Stage 5 `vectorized`:** 2365 GFLOP/s, **55.6%** of cuBLAS. **+7%** over register (below the 10–30% band, still a real win).
+
+Same 2048 error on tiled, register, and vectorized as Stages 1–2 (`1.53e-04` / `1.99e-06`, 4,000,760 mismatches). That is the correctness proof that 3–5 compute the same math.
 
 Req GB/s in the harness still uses the no-reuse formula `(2MNK+MN)×4`. That number is meaningful vs peak for Stages 1–2. From Stage 3 on it is an upper bound, not DRAM traffic.
-
-Do not fill TBD cells from memory. Paste Colab tables. Skip `--stage naive` this round; 4096 naive is ~2.2 s/iter.
-
-```bash
-./bench --stage tiled --sizes 1024 2048 4096
-./bench --stage register --sizes 1024 2048 4096
-./bench --stage vectorized --sizes 1024 2048 4096
-```
 
 ### Per-size (same T4 session)
 
@@ -45,6 +39,15 @@ Do not fill TBD cells from memory. Paste Colab tables. Skip `--stage naive` this
 | Coalesced | 1024 | 623.19 | 5262.86 | 11.84 | 2493.97 | 320.06 | 6.87e-05 | 1.27e-06 |
 | Coalesced | 2048 | 580.51 | 6271.55 | 9.26 | 2322.62 | 320.06 | 1.53e-04 | 1.99e-06 |
 | Coalesced | 4096 | 580.13 | 4175.41 | 13.89 | 2320.82 | 320.06 | 0* | 0* |
+| Tiled | 1024 | 364.64 | 3049.07 | 11.96 | 1459.29 | 320.06 | 6.87e-05 | 1.27e-06 |
+| Tiled | 2048 | 730.03 | 6396.33 | 11.41 | 2920.83 | 320.06 | 1.53e-04 | 1.99e-06 |
+| Tiled | 4096 | 725.61 | 4320.24 | 16.80 | 2902.81 | 320.06 | 0* | 0* |
+| Register | 1024 | 2622.10 | 5850.92 | 44.82 | 10493.50 | 320.06 | 6.87e-05 | 1.27e-06 |
+| Register | 2048 | 2363.78 | 7182.81 | 32.91 | 9457.42 | 320.06 | 1.53e-04 | 1.99e-06 |
+| Register | 4096 | 2202.43 | 4275.13 | 51.52 | 8810.81 | 320.06 | 0* | 0* |
+| Vectorized | 1024 | 2914.15 | 6255.84 | 46.58 | 11662.30 | 320.06 | 6.87e-05 | 1.27e-06 |
+| Vectorized | 2048 | 2432.24 | 6522.35 | 37.29 | 9731.35 | 320.06 | 1.53e-04 | 1.99e-06 |
+| Vectorized | 4096 | 2364.88 | 4253.37 | 55.60 | 9460.67 | 320.06 | 0* | 0* |
 
 \* Do not quote. GFLOP/s at 4096 recomputes from wall-clock (`2 N³ / (ms · 1e6)`); the error column does not.
 

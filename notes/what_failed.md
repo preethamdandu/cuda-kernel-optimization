@@ -28,10 +28,25 @@ This file tracks dead ends, wrong assumptions, and regressions during kernel opt
 - Evidence: GFLOP/s at 4096 recomputes from the reported ms (`2·4096³ / (2226.4778e-3 · 1e9) = 61.73`). Timing is fine. A length-4096 sequential FP32 dot vs cuBLAS should not be bitwise identical; √K · ε is ~7.6e-6 relative.
 
 ### Why it failed
-- Root cause: not known from the first run. The 4096 rerun printed `max|ref|=110.7` and still `max abs=0` for both stages. cuBLAS produced a real matrix (magnitude O(100) is right for 16M random length-4096 dots). The comparison loop reported bitwise identity, which sequential FP32 vs cuBLAS does not do. Almost certainly nvcc `-O3` eating `max_diff = std::max(max_diff, fabs(a-b))` at N=16,777,216, not a perfect kernel.
+- Root cause: not `std::max`. Stages 3–5 used the rewritten `if (diff > max_diff)` loop and still printed 0 mismatches / 0 abs at N=4096 with `max|ref|=110.7`. N=1024/2048 still show ~1e6 / ~4e6 mismatches. nvcc `-O3` is treating the two 16M-float buffers as equal (pointer aliasing / loop elision) only above that size.
 
 ### Next move
-- Quote error from N=2048 in the README. Replaced the `std::max` reduction with a plain `if (diff > max_diff)` loop and a mismatch counter. Re-run `./bench --stage naive --sizes 4096` once after `git pull` if you want the honest 4096 error; not required to close Week 1.
+- Quote error from N=2048. Mark compare-loop pointers `volatile` so the loads cannot be skipped. If 4096 is still zero after that, move the checker out of the `.cu` into a `.cpp` compiled by the host compiler.
+
+## 2026-08-21 — 32×32 tiling lost to coalesced at N=1024
+
+### Attempt
+- Stage: 3 (shared-memory 32×32 tiles) vs Stage 2 (coalesced, no shared).
+
+### What happened
+- Symptom: expected 2–3× over coalesced. Measured 0.58× at 1024 (365 vs 623 GFLOP/s) and only 1.25× at 4096 (726 vs 580).
+- Evidence: same T4 session, same error as Stage 2 at 1024/2048 (same math).
+
+### Why it failed
+- Root cause: one-thread-per-output 32×32 tiling still loads every A/B element from global once per output row/col of the *block*, but at N=1024 the coalesced kernel already streams from L2. Tiling adds two `__syncthreads()` per K-chunk and extra shared round-trips without enough extra reuse. The 2–3× textbook jump needs register blocking, not this tile size.
+
+### Next move
+- Leave Stage 3 as the teaching kernel. Do not retune it to beat Stage 2. Stage 4 (4×4 per thread) is the actual 3.8× jump.
 
 ## Planned — Colab ncu permission wall
 

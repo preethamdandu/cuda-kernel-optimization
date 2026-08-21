@@ -168,13 +168,17 @@ ErrorStats computeErrorStats(const std::vector<float>& out, const std::vector<fl
   if (ref.size() != count) {
     throw std::runtime_error("output and reference sizes differ");
   }
-  const float* out_ptr = out.data();
-  const float* ref_ptr = ref.data();
+  // nvcc -O3 at N=4096 has twice collapsed this reduction to "all equal"
+  // (std::max, then a non-volatile pointer loop with 0 mismatches while
+  // max|ref| was 110). Force the loads; do not let the compiler prove aliasing.
+  volatile const float* out_ptr = out.data();
+  volatile const float* ref_ptr = ref.data();
   float max_diff = 0.0f;
   float max_ref = 0.0f;
   for (std::size_t i = 0; i < count; ++i) {
     const float ref_val = ref_ptr[i];
-    const float diff = std::fabs(out_ptr[i] - ref_val);
+    const float out_val = out_ptr[i];
+    const float diff = std::fabs(out_val - ref_val);
     const float abs_ref = std::fabs(ref_val);
     if (diff > max_diff) {
       max_diff = diff;
