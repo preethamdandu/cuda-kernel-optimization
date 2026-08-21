@@ -33,6 +33,21 @@ This file tracks dead ends, wrong assumptions, and regressions during kernel opt
 ### Next move
 - Quote error from N=2048. Mark compare-loop pointers `volatile` so the loads cannot be skipped. If 4096 is still zero after that, move the checker out of the `.cu` into a `.cpp` compiled by the host compiler.
 
+## 2026-08-21 — WMMA printed zero error at every size
+
+### Attempt
+- Stage: 6 vs `cublasGemmEx` FP16 at 1024 / 2048 / 4096.
+
+### What happened
+- Symptom: 0 mismatches, 0 abs, 0 rel at **all three** sizes. `max|ref|` was 54 / 77 / 111 (real). Timing recomputes (4096: 4192 GFLOP/s from 32.79 ms).
+- Evidence: FP32 stages on the same checker at 1024/2048 reported ~1e6 / ~4e6 mismatches. WMMA hitting exact zero at 1024 is a new failure mode, not just the 4096 nvcc bug.
+
+### Why it failed
+- Root cause: unverified. Either the two Tensor Core paths are bit-identical, or the compare loop is still eliding diffs. Do not treat this as a correctness pass.
+
+### Next move
+- Re-run `./bench --stage vectorized --sizes 1024` on the WMMA binary. If mismatches come back, the checker still works and WMMA==cuBLAS is a real (surprising) result. If that is also zero, move the checker to a `.cpp` host TU.
+
 ## 2026-08-21 — 32×32 tiling lost to coalesced at N=1024
 
 ### Attempt

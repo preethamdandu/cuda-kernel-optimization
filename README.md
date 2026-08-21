@@ -11,9 +11,10 @@ SGEMM optimization ladder from an honest uncoalesced baseline through coalescing
 | 3 | Shared-memory tiled | FP32 | 725.61 | 16.80 | 2903 | 1.53e-04† | 1.99e-06† | 32×32 tiles; only 1.25× Stage 2 |
 | 4 | Register blocked | FP32 | 2202.43 | 51.52 | 8811 | 1.53e-04† | 1.99e-06† | 64×64 block, 4×4 per thread |
 | 5 | Vectorized loads | FP32 | 2364.88 | 55.60 | 9461 | 1.53e-04† | 1.99e-06† | float4; +7% over Stage 4 |
-| 6 | WMMA / Tensor Cores | FP16→FP32 | TBD | TBD | TBD | TBD | TBD | Compare against cuBLAS FP16 |
+| 6 | WMMA / Tensor Cores | FP16→FP32 | 4192 | 10.1‡ | 8386 | unverified | unverified | vs cuBLAS **FP16**, not FP32 |
 
-† Error quoted from N=2048. Both stages printed identical error there (same arithmetic). N=4096 printed `0.000e+00` for both abs and rel — that is not believable for a length-4096 FP32 dot product, so it is not in this table. See [notes/what_failed.md](notes/what_failed.md).
+† Error quoted from N=2048 FP32 stages. N=4096 FP32 error is not quoted.  
+‡ Stage 6 `% cuBLAS` is vs `cublasGemmEx` FP16 Tensor Cores (~41.5 TFLOPS at 4096), **not** vs FP32 cuBLAS (~4.2 TFLOPS). Do not put 10% and 55% in the same sentence.
 
 The only difference between these two kernels is which thread index drives the row. (For square M=N=K — the sizes in this table — the two grid expressions evaluate to identical `dim3` values; they would differ for non-square.)
 
@@ -27,13 +28,19 @@ Both kernels use `dim3 block(32, 32)`. Coalesced / naive at 4096 is **9.4×** (5
 
 Same 2048 error on tiled, register, and vectorized as Stages 1–2 (`1.53e-04` / `1.99e-06`, 4,000,760 mismatches). That is the correctness proof that 3–5 compute the same math.
 
-## Stage 6 WMMA (code in, numbers next Colab run)
+## Stage 6 WMMA (Tesla T4)
 
-`--stage wmma`: FP16 A/B, FP32 accumulate, 16×16×16 WMMA fragments, 64×64 block tile. Compared against **cuBLAS FP16 Tensor Cores** (`cublasGemmEx`, `CUBLAS_COMPUTE_32F`), not FP32. FP32→FP16 conversion is untimed; only the WMMA kernel is in the event window. Relative gate is `1e-2`. Do not mix this `% cuBLAS` with Stages 1–5.
+`--stage wmma`: FP16 A/B, FP32 accumulate, 16×16×16 fragments, 64×64 block. Conversion is untimed. Baseline is **cuBLAS FP16 Tensor Cores**.
 
-```bash
-./bench --stage wmma --sizes 1024 2048 4096
-```
+| N | Kernel GF/s | cuBLAS FP16 GF/s | % cuBLAS FP16 | Avg ms |
+|---:|---:|---:|---:|---:|
+| 1024 | 2383 | 20126 | 11.8 | 0.90 |
+| 2048 | 2585 | 30760 | 8.4 | 6.65 |
+| 4096 | 4192 | 41512 | 10.1 | 32.79 |
+
+cuBLAS 41.5 TFLOPS at 4096 is ~64% of T4 FP16 Tensor Core peak (~65 TFLOPS). That baseline is healthy. The WMMA kernel is **4.2 TFLOPS, ~10% of that cuBLAS**, about **1.8×** Stage 5's FP32 2.37 TFLOPS. This is a teaching WMMA (no async copy, no double-buffer, 64×64 tile), not 60–80% of cuBLAS FP16. Do not inflate it.
+
+Correctness printed 0 mismatches at 1024, 2048, and 4096 with `max|ref|` 54 / 77 / 111. FP32 stages at 1024/2048 had ~1e6 / ~4e6 mismatches. Either WMMA matches `cublasGemmEx` bitwise (possible if both hit the same MMA) or the compare loop is still lying. Error column is **unverified** until `./bench --stage vectorized --sizes 1024` still shows ~1e6 mismatches on this binary. See [notes/what_failed.md](notes/what_failed.md).
 
 Req GB/s in the harness still uses the no-reuse formula `(2MNK+MN)×4`. That number is meaningful vs peak for Stages 1–2. From Stage 3 on it is an upper bound, not DRAM traffic. Stage 6 uses 2-byte A/B in that formula.
 
