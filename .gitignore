@@ -1,0 +1,7 @@
+bench
+bench_*
+*.o
+*.out
+*.ncu-rep
+.DS_Store
+.ipynb_checkpoints
