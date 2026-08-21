@@ -56,18 +56,6 @@ struct DeviceBuffer {
     other.count = 0;
   }
 
-  DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
-    if (this == &other) {
-      return *this;
-    }
-    reset();
-    ptr = other.ptr;
-    count = other.count;
-    other.ptr = nullptr;
-    other.count = 0;
-    return *this;
-  }
-
   ~DeviceBuffer() { reset(); }
 
   void reset() {
@@ -103,6 +91,7 @@ struct BenchmarkResult {
   double gflops = 0.0;
   double requested_gbs = 0.0;
   float max_abs_diff = 0.0f;
+  float max_abs_ref = 0.0f;
   float max_rel_diff = 0.0f;
 };
 
@@ -273,8 +262,8 @@ BenchmarkResult runCustomKernel(const StageDefinition& stage, int m, int n, int 
 
   BenchmarkResult result;
   result.max_abs_diff = computeMaxAbsDiff(host_c, host_reference);
-  const float max_abs_ref = computeMaxAbs(host_reference);
-  result.max_rel_diff = result.max_abs_diff / std::max(max_abs_ref, kRelDenomFloor);
+  result.max_abs_ref = computeMaxAbs(host_reference);
+  result.max_rel_diff = result.max_abs_diff / std::max(result.max_abs_ref, kRelDenomFloor);
 
   CudaEventPair timer;
   for (int run = 0; run < kWarmupRuns; ++run) {
@@ -388,6 +377,7 @@ int main(int argc, char** argv) {
               << std::setw(12) << "Avg ms"
               << std::setw(14) << "Req GB/s"
               << std::setw(14) << "Max abs err"
+              << std::setw(14) << "Max |ref|"
               << std::setw(14) << "Max rel err"
               << "\n";
 
@@ -403,8 +393,15 @@ int main(int argc, char** argv) {
                 << std::setw(12) << std::fixed << std::setprecision(4) << custom.milliseconds
                 << std::setw(14) << std::fixed << std::setprecision(2) << custom.requested_gbs
                 << std::setw(14) << std::scientific << std::setprecision(3) << custom.max_abs_diff
+                << std::setw(14) << std::scientific << std::setprecision(3) << custom.max_abs_ref
                 << std::setw(14) << std::scientific << std::setprecision(3) << custom.max_rel_diff
                 << "\n";
+
+      if (custom.max_abs_diff == 0.0f && custom.max_abs_ref > 1.0f) {
+        std::cerr << "Warning: exact-zero abs error at size " << size
+                  << " with max|ref|=" << custom.max_abs_ref
+                  << " is not expected for sequential FP32 vs cuBLAS.\n";
+      }
 
       if (custom.max_rel_diff > stage.rel_tolerance) {
         std::cerr << "Correctness check failed for size " << size
