@@ -1,4 +1,5 @@
 #include "../src/attn.cuh"
+#include "error_stats.hpp"
 
 #include <cuda_runtime.h>
 
@@ -17,7 +18,6 @@ constexpr int kWarmupRuns = 3;
 constexpr int kTimedRuns = 10;
 constexpr int kHeadDim = 64;
 constexpr float kRelTolerance = 1.0e-3f;
-constexpr float kRelDenomFloor = 1.0e-12f;
 
 void checkCuda(cudaError_t status, const std::string& label) {
   if (status != cudaSuccess) {
@@ -118,39 +118,6 @@ float timeLaunch(const CudaEventPair& events, Launch&& launch) {
   return total_ms / static_cast<float>(kTimedRuns);
 }
 
-struct ErrorStats {
-  float max_abs_diff = 0.0f;
-  float max_abs_ref = 0.0f;
-  float max_rel_diff = 0.0f;
-  std::size_t mismatch_count = 0;
-};
-
-ErrorStats compareHost(const std::vector<float>& out, const std::vector<float>& ref) {
-  ErrorStats stats;
-  if (out.size() != ref.size()) {
-    throw std::runtime_error("output and reference sizes differ");
-  }
-  for (std::size_t i = 0; i < out.size(); ++i) {
-    const float diff = std::fabs(out[i] - ref[i]);
-    const float abs_ref = std::fabs(ref[i]);
-    if (diff > stats.max_abs_diff) {
-      stats.max_abs_diff = diff;
-    }
-    if (abs_ref > stats.max_abs_ref) {
-      stats.max_abs_ref = abs_ref;
-    }
-  }
-  const float denom = std::max(stats.max_abs_ref, kRelDenomFloor);
-  stats.max_rel_diff = stats.max_abs_diff / denom;
-  for (std::size_t i = 0; i < out.size(); ++i) {
-    const float diff = std::fabs(out[i] - ref[i]);
-    if (diff > kRelTolerance * denom) {
-      ++stats.mismatch_count;
-    }
-  }
-  return stats;
-}
-
 void printDevice() {
   cudaDeviceProp props{};
   checkCuda(cudaGetDeviceProperties(&props, 0), "cudaGetDeviceProperties");
@@ -158,10 +125,39 @@ void printDevice() {
                                (static_cast<double>(props.memoryBusWidth) / 8.0) / 1.0e9;
   std::cout << "Device: " << props.name << "\n";
   std::cout << "SMs: " << props.multiProcessorCount << "\n";
+  std::cout << "Max threads per SM: " << props.maxThreadsPerMultiProcessor << "\n";
+  std::cout << "L2 cache: " << props.l2CacheSize / (1024 * 1024) << " MiB\n";
   std::cout << "Peak DRAM: " << std::fixed << std::setprecision(2) << peak_dram_gbs << " GB/s\n";
   std::cout << "head_dim: " << kHeadDim << " (single head, batch=1)\n";
   std::cout << "FLOPs counted as 4*seq*seq*d (QK^T + PV); softmax excluded\n";
   std::cout << "Unfused times QK + softmax + PV as one event pair\n\n";
+}
+
+void printOccupancy(int seq) {
+  std::vector<KernelOccupancy> all = describeUnfusedAttention(seq, kHeadDim);
+  for (const auto& entry : describeFusedAttention(seq)) {
+    all.push_back(entry);
+  }
+  for (const auto& entry : describeFusedAttentionV2(seq)) {
+    all.push_back(entry);
+  }
+
+  std::cout << "Launch geometry and occupancy at seq=" << seq
+            << " (cudaFuncGetAttributes + cudaOccupancyMaxActiveBlocksPerMultiprocessor,\n"
+               "no Nsight counters needed):\n\n";
+  std::cout << std::left << std::setw(30) << "Kernel" << std::right << std::setw(8) << "Regs"
+            << std::setw(10) << "Smem B" << std::setw(10) << "Local B" << std::setw(9) << "Thr/blk"
+            << std::setw(9) << "Blocks" << std::setw(12) << "Warps" << std::setw(12) << "Blk/SM"
+            << std::setw(12) << "Occupancy" << "\n";
+  for (const auto& info : all) {
+    std::cout << std::left << std::setw(30) << info.name << std::right << std::setw(8)
+              << info.registers_per_thread << std::setw(10) << info.static_shared_bytes
+              << std::setw(10) << info.local_bytes_per_thread << std::setw(9) << info.block_threads
+              << std::setw(9) << info.grid_blocks << std::setw(12) << info.total_warps
+              << std::setw(12) << info.max_active_blocks_per_sm << std::setw(11) << std::fixed
+              << std::setprecision(1) << info.occupancy * 100.0 << "%" << "\n";
+  }
+  std::cout << "\n";
 }
 
 }  // namespace
@@ -170,18 +166,24 @@ int main(int argc, char** argv) {
   try {
     const std::vector<int> seqs = parseSeqs(argc, argv);
     printDevice();
+    if (!seqs.empty()) {
+      printOccupancy(seqs.back());
+    }
 
-    std::cout << std::left << std::setw(8) << "seq" << std::right << std::setw(12)
-              << "unfused_ms" << std::setw(12) << "fused_ms" << std::setw(10) << "speedup"
-              << std::setw(14) << "unfused_GF/s" << std::setw(14) << "fused_GF/s" << std::setw(12)
-              << "S_MiB" << std::setw(12) << "max_abs" << std::setw(12) << "max_rel" << std::setw(12)
-              << "mismatch" << "\n";
+    std::cout << std::left << std::setw(7) << "seq" << std::right << std::setw(12) << "unfused_ms"
+              << std::setw(11) << "v1_ms" << std::setw(11) << "v2_ms" << std::setw(10) << "v1_spd"
+              << std::setw(10) << "v2_spd" << std::setw(11) << "v2/v1" << std::setw(13)
+              << "unfused_GF/s" << std::setw(11) << "v2_GF/s" << std::setw(9) << "S_MiB"
+              << std::setw(12) << "v2_maxabs" << std::setw(11) << "v2_fail" << "\n";
 
     CudaEventPair events;
 
     for (int seq : seqs) {
-      if (seq <= 0 || seq > 1024) {
-        throw std::runtime_error("seq must be in (0, 1024]");
+      if (seq <= 0) {
+        throw std::runtime_error("seq must be positive");
+      }
+      if (seq > 1024) {
+        throw std::runtime_error("fused v1 supports seq_len <= 1024");
       }
 
       const std::size_t qkv = static_cast<std::size_t>(seq) * static_cast<std::size_t>(kHeadDim);
@@ -191,7 +193,8 @@ int main(int argc, char** argv) {
       const auto k_h = makeRandom(qkv, 43);
       const auto v_h = makeRandom(qkv, 44);
 
-      DeviceBuffer q(qkv), k(qkv), v(qkv), scores(scores_n), out_unfused(qkv), out_fused(qkv);
+      DeviceBuffer q(qkv), k(qkv), v(qkv), scores(scores_n);
+      DeviceBuffer out_unfused(qkv), out_v1(qkv), out_v2(qkv);
       checkCuda(cudaMemcpy(q.ptr, q_h.data(), qkv * sizeof(float), cudaMemcpyHostToDevice), "H2D Q");
       checkCuda(cudaMemcpy(k.ptr, k_h.data(), qkv * sizeof(float), cudaMemcpyHostToDevice), "H2D K");
       checkCuda(cudaMemcpy(v.ptr, v_h.data(), qkv * sizeof(float), cudaMemcpyHostToDevice), "H2D V");
@@ -201,44 +204,57 @@ int main(int argc, char** argv) {
       });
       checkCuda(cudaGetLastError(), "unfused launch");
 
-      const float fused_ms = timeLaunch(events, [&]() {
-        launchFusedAttention(q.ptr, k.ptr, v.ptr, out_fused.ptr, seq, kHeadDim);
+      const float v1_ms = timeLaunch(events, [&]() {
+        launchFusedAttention(q.ptr, k.ptr, v.ptr, out_v1.ptr, seq, kHeadDim);
       });
-      checkCuda(cudaGetLastError(), "fused launch");
+      checkCuda(cudaGetLastError(), "fused v1 launch");
+
+      const float v2_ms = timeLaunch(events, [&]() {
+        launchFusedAttentionV2(q.ptr, k.ptr, v.ptr, out_v2.ptr, seq, kHeadDim);
+      });
+      checkCuda(cudaGetLastError(), "fused v2 launch");
       checkCuda(cudaDeviceSynchronize(), "final sync");
 
-      std::vector<float> unfused_h(qkv), fused_h(qkv);
+      std::vector<float> unfused_h(qkv), v1_h(qkv), v2_h(qkv);
       checkCuda(cudaMemcpy(unfused_h.data(), out_unfused.ptr, qkv * sizeof(float),
                            cudaMemcpyDeviceToHost),
                 "D2H unfused");
-      checkCuda(cudaMemcpy(fused_h.data(), out_fused.ptr, qkv * sizeof(float), cudaMemcpyDeviceToHost),
-                "D2H fused");
+      checkCuda(cudaMemcpy(v1_h.data(), out_v1.ptr, qkv * sizeof(float), cudaMemcpyDeviceToHost),
+                "D2H v1");
+      checkCuda(cudaMemcpy(v2_h.data(), out_v2.ptr, qkv * sizeof(float), cudaMemcpyDeviceToHost),
+                "D2H v2");
 
-      const ErrorStats err = compareHost(fused_h, unfused_h);
+      const bench::ErrorStats v1_err = bench::computeErrorStats(v1_h, unfused_h, kRelTolerance);
+      const bench::ErrorStats v2_err = bench::computeErrorStats(v2_h, unfused_h, kRelTolerance);
+
       const double flops = 4.0 * static_cast<double>(seq) * static_cast<double>(seq) *
                            static_cast<double>(kHeadDim);
-      const double unfused_gflops = flops / (static_cast<double>(unfused_ms) * 1.0e6);
-      const double fused_gflops = flops / (static_cast<double>(fused_ms) * 1.0e6);
       const double scores_mib = static_cast<double>(scores_n * sizeof(float)) / (1024.0 * 1024.0);
-      const float speedup = unfused_ms / fused_ms;
 
-      std::cout << std::left << std::setw(8) << seq << std::right << std::fixed
-                << std::setprecision(4) << std::setw(12) << unfused_ms << std::setw(12) << fused_ms
-                << std::setprecision(2) << std::setw(10) << speedup << std::setprecision(1)
-                << std::setw(14) << unfused_gflops << std::setw(14) << fused_gflops
-                << std::setprecision(3) << std::setw(12) << scores_mib << std::scientific
-                << std::setprecision(2) << std::setw(12) << err.max_abs_diff << std::setw(12)
-                << err.max_rel_diff << std::setw(12) << err.mismatch_count << "\n";
+      std::cout << std::left << std::setw(7) << seq << std::right << std::fixed
+                << std::setprecision(4) << std::setw(12) << unfused_ms << std::setw(11) << v1_ms
+                << std::setw(11) << v2_ms << std::setprecision(2) << std::setw(10)
+                << unfused_ms / v1_ms << std::setw(10) << unfused_ms / v2_ms << std::setw(11)
+                << v1_ms / v2_ms << std::setprecision(1) << std::setw(13)
+                << flops / (static_cast<double>(unfused_ms) * 1.0e6) << std::setw(11)
+                << flops / (static_cast<double>(v2_ms) * 1.0e6) << std::setprecision(2)
+                << std::setw(9) << scores_mib << std::scientific << std::setprecision(2)
+                << std::setw(12) << v2_err.max_abs_diff << std::setw(11) << v2_err.fail_elems
+                << "\n";
 
-      if (err.max_rel_diff > kRelTolerance) {
-        throw std::runtime_error("fused vs unfused relative error " +
-                                 std::to_string(err.max_rel_diff) + " exceeds " +
-                                 std::to_string(kRelTolerance));
+      if (v1_err.max_rel_diff > kRelTolerance) {
+        throw std::runtime_error("fused v1 rel error " + std::to_string(v1_err.max_rel_diff) +
+                                 " exceeds " + std::to_string(kRelTolerance));
+      }
+      if (v2_err.max_rel_diff > kRelTolerance) {
+        throw std::runtime_error("fused v2 rel error " + std::to_string(v2_err.max_rel_diff) +
+                                 " exceeds " + std::to_string(kRelTolerance));
       }
     }
 
-    std::cout << "\nPASS: fused matches unfused within rel " << kRelTolerance
-              << " (host-side compare).\n";
+    std::cout << "\nv1_spd / v2_spd are unfused/fused, so >1 means fusion won.\n";
+    std::cout << "PASS: both fused kernels match unfused within rel " << std::scientific
+              << std::setprecision(1) << kRelTolerance << " (host-side compare).\n";
     return 0;
   } catch (const std::exception& ex) {
     std::cerr << "ERROR: " << ex.what() << "\n";

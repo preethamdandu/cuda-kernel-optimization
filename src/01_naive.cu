@@ -42,3 +42,8 @@ void launchNaiveSgemm(const float* a,
   dim3 grid((m + block.x - 1) / block.x, (n + block.y - 1) / block.y);
   naiveSgemmKernel<<<grid, block>>>(a, b, c, m, n, k);
 }
+
+std::vector<KernelOccupancy> describeNaiveSgemm(int n) {
+  const int tiles = (n + 31) / 32;
+  return {describeKernel("naive", naiveSgemmKernel, 1024, tiles * tiles)};
+}

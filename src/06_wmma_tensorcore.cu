@@ -110,3 +110,8 @@ void launchWmmaSgemm(const __half* a,
   dim3 grid(n / kBN, m / kBM);
   wmmaSgemmKernel<<<grid, block>>>(a, b, c, m, n, k);
 }
+
+std::vector<KernelOccupancy> describeWmmaSgemm(int n) {
+  const int tiles = (n + kBN - 1) / kBN;
+  return {describeKernel("wmma", wmmaSgemmKernel, 32 * 16, tiles * tiles)};
+}

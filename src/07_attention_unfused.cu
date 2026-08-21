@@ -94,3 +94,12 @@ void launchUnfusedAttention(const float* q,
   dim3 pv_grid((head_dim + 31) / 32, (seq + 31) / 32);
   pvKernel<<<pv_grid, block>>>(scores, v, out, seq, head_dim);
 }
+
+std::vector<KernelOccupancy> describeUnfusedAttention(int seq, int head_dim) {
+  const int tiles = (seq + 31) / 32;
+  return {
+      describeKernel("unfused QK^T", qkKernel, 1024, tiles * tiles),
+      describeKernel("unfused softmax", softmaxKernel, 128, (seq + 127) / 128),
+      describeKernel("unfused PV", pvKernel, 1024, ((head_dim + 31) / 32) * tiles),
+  };
+}

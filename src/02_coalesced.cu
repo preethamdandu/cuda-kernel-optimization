@@ -44,3 +44,8 @@ void launchCoalescedSgemm(const float* a,
   dim3 grid((n + block.x - 1) / block.x, (m + block.y - 1) / block.y);
   coalescedSgemmKernel<<<grid, block>>>(a, b, c, m, n, k);
 }
+
+std::vector<KernelOccupancy> describeCoalescedSgemm(int n) {
+  const int tiles = (n + 31) / 32;
+  return {describeKernel("coalesced", coalescedSgemmKernel, 1024, tiles * tiles)};
+}

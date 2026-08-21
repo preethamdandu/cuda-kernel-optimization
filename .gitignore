@@ -1,7 +1,12 @@
 /bench
 /bench_attn
+/test_error_stats
+/test_attn_math
 *.o
 *.out
 *.ncu-rep
+*.nsys-rep
+*.sqlite
+__pycache__/
 .DS_Store
 .ipynb_checkpoints

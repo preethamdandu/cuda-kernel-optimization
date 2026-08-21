@@ -64,3 +64,8 @@ void launchTiledSgemm(const float* a,
   dim3 grid((n + kTile - 1) / kTile, (m + kTile - 1) / kTile);
   tiledSgemmKernel<<<grid, block>>>(a, b, c, m, n, k);
 }
+
+std::vector<KernelOccupancy> describeTiledSgemm(int n) {
+  const int tiles = (n + kTile - 1) / kTile;
+  return {describeKernel("tiled", tiledSgemmKernel, kTile * kTile, tiles * tiles)};
+}

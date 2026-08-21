@@ -116,3 +116,9 @@ void launchRegisterBlockedSgemm(const float* a,
   dim3 grid((n + kBN - 1) / kBN, (m + kBM - 1) / kBM);
   registerBlockedSgemmKernel<<<grid, block>>>(a, b, c, m, n, k);
 }
+
+std::vector<KernelOccupancy> describeRegisterBlockedSgemm(int n) {
+  const int tiles = (n + kBN - 1) / kBN;
+  return {describeKernel(
+      "register blocked", registerBlockedSgemmKernel, (kBN / kTN) * (kBM / kTM), tiles * tiles)};
+}

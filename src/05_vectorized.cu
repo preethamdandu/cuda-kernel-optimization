@@ -136,3 +136,9 @@ void launchVectorizedSgemm(const float* a,
   dim3 grid((n + kBN - 1) / kBN, (m + kBM - 1) / kBM);
   vectorizedSgemmKernel<<<grid, block>>>(a, b, c, m, n, k);
 }
+
+std::vector<KernelOccupancy> describeVectorizedSgemm(int n) {
+  const int tiles = (n + kBN - 1) / kBN;
+  return {describeKernel(
+      "vectorized", vectorizedSgemmKernel, (kBN / kTN) * (kBM / kTM), tiles * tiles)};
+}

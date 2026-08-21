@@ -111,3 +111,8 @@ void launchFusedAttention(const float* q,
   const int blocks = (seq + kBr - 1) / kBr;
   fusedAttentionKernel<<<blocks, kBr>>>(q, k, v, out, seq, scale);
 }
+
+std::vector<KernelOccupancy> describeFusedAttention(int seq) {
+  return {describeKernel(
+      "fused v1 (thread per Q row)", fusedAttentionKernel, kBr, (seq + kBr - 1) / kBr)};
+}
