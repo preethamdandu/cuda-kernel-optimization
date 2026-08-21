@@ -71,7 +71,9 @@ Colab `ncu` is expected to print `ERR_NVGPU_PERMISSION` / counters denied. That 
 
 ## Run on Colab
 
-Open [`notebooks/colab_week1.ipynb`](notebooks/colab_week1.ipynb). Runtime → Change runtime type → GPU (T4 on free Colab). Then:
+Open [`notebooks/colab_week1.ipynb`](notebooks/colab_week1.ipynb). **Runtime → Change runtime type → Hardware accelerator = T4 GPU**, then **Runtime → Run all**. A CPU runtime has no `nvidia-smi` and no `nvcc`; that is the `command not found` / `sm_` error. Changing the accelerator reconnects you to a new VM, so clone again after the switch.
+
+Then:
 
 ```bash
 REPO_URL="https://github.com/preethamdandu/cuda-kernel-optimization.git"
