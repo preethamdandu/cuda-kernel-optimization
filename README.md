@@ -27,7 +27,15 @@ Both kernels use `dim3 block(32, 32)`. Coalesced / naive at 4096 is **9.4×** (5
 
 Same 2048 error on tiled, register, and vectorized as Stages 1–2 (`1.53e-04` / `1.99e-06`, 4,000,760 mismatches). That is the correctness proof that 3–5 compute the same math.
 
-Req GB/s in the harness still uses the no-reuse formula `(2MNK+MN)×4`. That number is meaningful vs peak for Stages 1–2. From Stage 3 on it is an upper bound, not DRAM traffic.
+## Stage 6 WMMA (code in, numbers next Colab run)
+
+`--stage wmma`: FP16 A/B, FP32 accumulate, 16×16×16 WMMA fragments, 64×64 block tile. Compared against **cuBLAS FP16 Tensor Cores** (`cublasGemmEx`, `CUBLAS_COMPUTE_32F`), not FP32. FP32→FP16 conversion is untimed; only the WMMA kernel is in the event window. Relative gate is `1e-2`. Do not mix this `% cuBLAS` with Stages 1–5.
+
+```bash
+./bench --stage wmma --sizes 1024 2048 4096
+```
+
+Req GB/s in the harness still uses the no-reuse formula `(2MNK+MN)×4`. That number is meaningful vs peak for Stages 1–2. From Stage 3 on it is an upper bound, not DRAM traffic. Stage 6 uses 2-byte A/B in that formula.
 
 ### Per-size (same T4 session)
 
