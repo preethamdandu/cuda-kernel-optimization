@@ -28,10 +28,10 @@ This file tracks dead ends, wrong assumptions, and regressions during kernel opt
 - Evidence: GFLOP/s at 4096 recomputes from the reported ms (`2·4096³ / (2226.4778e-3 · 1e9) = 61.73`). Timing is fine. A length-4096 sequential FP32 dot vs cuBLAS should not be bitwise identical; √K · ε is ~7.6e-6 relative.
 
 ### Why it failed
-- Root cause: not known. Same A/B seeds and same arithmetic explain why Stage 1 and Stage 2 *match each other*. They do not explain a true zero against cuBLAS. Do not treat 4096 as "more correct than 2048."
+- Root cause: not known from the first run. The 4096 rerun printed `max|ref|=110.7` and still `max abs=0` for both stages. cuBLAS produced a real matrix (magnitude O(100) is right for 16M random length-4096 dots). The comparison loop reported bitwise identity, which sequential FP32 vs cuBLAS does not do. Almost certainly nvcc `-O3` eating `max_diff = std::max(max_diff, fabs(a-b))` at N=16,777,216, not a perfect kernel.
 
 ### Next move
-- Quote error from N=2048 in the README. Re-run `./bench --stage naive --sizes 4096` and `./bench --stage coalesced --sizes 4096` after printing `max|ref|` next to max abs. If `max|ref|` is also 0, the D2H copy of the reference is the bug. If `max|ref|` is O(10) and max abs is still 0, the comparison loop is the bug.
+- Quote error from N=2048 in the README. Replaced the `std::max` reduction with a plain `if (diff > max_diff)` loop and a mismatch counter. Re-run `./bench --stage naive --sizes 4096` once after `git pull` if you want the honest 4096 error; not required to close Week 1.
 
 ## Planned — Colab ncu permission wall
 

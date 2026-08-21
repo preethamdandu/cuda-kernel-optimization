@@ -93,6 +93,7 @@ struct BenchmarkResult {
   float max_abs_diff = 0.0f;
   float max_abs_ref = 0.0f;
   float max_rel_diff = 0.0f;
+  std::size_t mismatch_count = 0;
 };
 
 std::vector<int> parseSizes(int argc, char** argv) {
@@ -150,20 +151,48 @@ std::vector<float> makeRandomMatrix(std::size_t count, unsigned seed) {
   return values;
 }
 
-float computeMaxAbsDiff(const std::vector<float>& lhs, const std::vector<float>& rhs) {
-  float max_diff = 0.0f;
-  for (std::size_t i = 0; i < lhs.size(); ++i) {
-    max_diff = std::max(max_diff, std::fabs(lhs[i] - rhs[i]));
-  }
-  return max_diff;
-}
+struct ErrorStats {
+  float max_abs_diff = 0.0f;
+  float max_abs_ref = 0.0f;
+  float max_rel_diff = 0.0f;
+  std::size_t mismatch_count = 0;
+  std::size_t first_mismatch = static_cast<std::size_t>(-1);
+};
 
-float computeMaxAbs(const std::vector<float>& values) {
-  float max_abs = 0.0f;
-  for (float value : values) {
-    max_abs = std::max(max_abs, std::fabs(value));
+ErrorStats computeErrorStats(const std::vector<float>& out, const std::vector<float>& ref) {
+  // Do not use std::max here. nvcc -O3 has been observed to collapse
+  // `max_diff = std::max(max_diff, fabs(a-b))` into a constant 0 at N=4096
+  // while a separate max|ref| loop still sees real values.
+  ErrorStats stats;
+  const std::size_t count = out.size();
+  if (ref.size() != count) {
+    throw std::runtime_error("output and reference sizes differ");
   }
-  return max_abs;
+  const float* out_ptr = out.data();
+  const float* ref_ptr = ref.data();
+  float max_diff = 0.0f;
+  float max_ref = 0.0f;
+  for (std::size_t i = 0; i < count; ++i) {
+    const float ref_val = ref_ptr[i];
+    const float diff = std::fabs(out_ptr[i] - ref_val);
+    const float abs_ref = std::fabs(ref_val);
+    if (diff > max_diff) {
+      max_diff = diff;
+    }
+    if (abs_ref > max_ref) {
+      max_ref = abs_ref;
+    }
+    if (diff > 0.0f) {
+      ++stats.mismatch_count;
+      if (stats.first_mismatch == static_cast<std::size_t>(-1)) {
+        stats.first_mismatch = i;
+      }
+    }
+  }
+  stats.max_abs_diff = max_diff;
+  stats.max_abs_ref = max_ref;
+  stats.max_rel_diff = max_diff / std::max(max_ref, kRelDenomFloor);
+  return stats;
 }
 
 void launchStage(const StageDefinition& stage,
@@ -261,9 +290,11 @@ BenchmarkResult runCustomKernel(const StageDefinition& stage, int m, int n, int 
       "Copy cuBLAS output to host");
 
   BenchmarkResult result;
-  result.max_abs_diff = computeMaxAbsDiff(host_c, host_reference);
-  result.max_abs_ref = computeMaxAbs(host_reference);
-  result.max_rel_diff = result.max_abs_diff / std::max(result.max_abs_ref, kRelDenomFloor);
+  const ErrorStats error = computeErrorStats(host_c, host_reference);
+  result.max_abs_diff = error.max_abs_diff;
+  result.max_abs_ref = error.max_abs_ref;
+  result.max_rel_diff = error.max_rel_diff;
+  result.mismatch_count = error.mismatch_count;
 
   CudaEventPair timer;
   for (int run = 0; run < kWarmupRuns; ++run) {
@@ -379,6 +410,7 @@ int main(int argc, char** argv) {
               << std::setw(14) << "Max abs err"
               << std::setw(14) << "Max |ref|"
               << std::setw(14) << "Max rel err"
+              << std::setw(12) << "Mismatches"
               << "\n";
 
     for (int size : sizes) {
@@ -395,6 +427,7 @@ int main(int argc, char** argv) {
                 << std::setw(14) << std::scientific << std::setprecision(3) << custom.max_abs_diff
                 << std::setw(14) << std::scientific << std::setprecision(3) << custom.max_abs_ref
                 << std::setw(14) << std::scientific << std::setprecision(3) << custom.max_rel_diff
+                << std::setw(12) << custom.mismatch_count
                 << "\n";
 
       if (custom.max_abs_diff == 0.0f && custom.max_abs_ref > 1.0f) {
