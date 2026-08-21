@@ -2,35 +2,41 @@
 
 SGEMM optimization ladder from an honest uncoalesced baseline through coalescing, tiling, register blocking, vectorized loads, and Tensor Cores — then the same ideas applied to fused attention.
 
-**GPU:** Tesla T4, 40 SMs, sm_75. Peak DRAM 320.06 GB/s (from `cudaGetDeviceProperties`: mem clock 5001 MHz, 256-bit bus). Colab, 2026-08-21. Headline numbers are N=4096.
+**GPU:** Tesla T4, 40 SMs, sm_75. Peak DRAM 320.06 GB/s (from `cudaGetDeviceProperties`: mem clock 5001 MHz, 256-bit bus). Colab, 2026-08-21, single session via [`scripts/run_all.sh`](scripts/run_all.sh). Headline numbers are N=4096.
 
-| Stage | Kernel | Precision | GFLOP/s | % cuBLAS | Req GB/s | Max abs err | Max rel err | Notes |
-|---|---|---|---:|---:|---:|---:|---:|---|
-| 1 | Naive (uncoalesced) | FP32 | 61.73 | 1.48 | 247 | 1.53e-04† | 1.99e-06† | `threadIdx.x` → row |
-| 2 | Coalesced | FP32 | 580.13 | 13.89 | 2321 | 1.53e-04† | 1.99e-06† | `threadIdx.x` → col |
-| 3 | Shared-memory tiled | FP32 | 725.61 | 16.80 | 2903 | 1.53e-04† | 1.99e-06† | 32×32 tiles; only 1.25× Stage 2 |
-| 4 | Register blocked | FP32 | 2202.43 | 51.52 | 8811 | 1.53e-04† | 1.99e-06† | 64×64 block, 4×4 per thread |
-| 5 | Vectorized loads | FP32 | 2364.88 | 55.60 | 9461 | 1.53e-04† | 1.99e-06† | float4; +7% over Stage 4 |
-| 6 | WMMA / Tensor Cores | FP16→FP32 | 4192 | 10.1‡ | 8386 | unverified | unverified | vs cuBLAS **FP16**, not FP32 |
+| Stage | Kernel | Precision | GFLOP/s | % cuBLAS | Sectors/req† | Achieved occ.† | Max abs err‡ | Max rel err‡ |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | Naive (uncoalesced) | FP32 | 61.77 | 1.79 | **16.5** | 98.1% | 1.53e-04 | 1.99e-06 |
+| 2 | Coalesced | FP32 | 530.21 | 15.57 | **2.5** | 98.5% | 1.53e-04 | 1.99e-06 |
+| 3 | Shared-memory tiled | FP32 | 656.99 | 19.18 | 4.0 | 100.0% | 1.53e-04 | 1.99e-06 |
+| 4 | Register blocked | FP32 | 1813.60 | 54.16 | 3.95 | 66.6% | 1.53e-04 | 1.99e-06 |
+| 5 | Vectorized loads | FP32 | 2046.31 | 61.48 | 15.67 | 81.6% | 1.53e-04 | 1.99e-06 |
+| 6 | WMMA / Tensor Cores | FP16→FP32 | 3489.60 | 9.58§ | — | — | 0 (bitwise) | 0 (bitwise) |
 
-† Error quoted from N=2048. At N=4096 the T4 run matched cuBLAS bit for bit — see [bitwise matches](#about-the-bitwise-matches), which is a real result, not a broken checker.  
-‡ Stage 6 `% cuBLAS` is vs `cublasGemmEx` FP16 Tensor Cores (~41.5 TFLOPS at 4096), **not** vs FP32 cuBLAS (~4.2 TFLOPS). Do not put 10% and 55% in the same sentence.
+† Measured with Nsight Compute at N=1024. See [measured memory behaviour](#measured-memory-behaviour-nsight-compute-t4). Sectors/request is only meaningful against the access width: 4 is perfect for a `float` load, 16 for a `float4`, so Stage 5's 15.67 is optimal, not a regression.  
+‡ Error quoted from N=2048. At N=4096 every FP32 stage matched cuBLAS bit for bit — see [bitwise matches](#about-the-bitwise-matches), which is a real result, not a broken checker. No stage had a single element past tolerance at any size.  
+§ Stage 6 `% cuBLAS` is vs `cublasGemmEx` FP16 Tensor Cores (36.4 TFLOPS at 4096), **not** vs FP32 cuBLAS (3.3 TFLOPS). Do not put 9.6% and 61% in the same sentence.
 
-Week 4 (same T4): fused attention wins only at seq=1024 (**1.47×** unfused); it **loses** at 256/512. Triton SGEMM is **80.8%** of `torch.matmul` at 4096 vs Stage 5 CUDA **55.6%** of cuBLAS. Details below.
+The two headline results:
+
+- **Coalescing is 8.6×** (530.21 / 61.77 at 4096), and the counters show why: **16.5 → 2.5 sectors per request**, which is 35.4 GB of L1 traffic collapsing to 5.4 GB for identical arithmetic.
+- **Fused attention v2 is 8.5–9.8× faster than unfused** at every sequence length, after a rewrite that took the kernel from 32 warps to 1024. The [previous version lost](#the-fused-attention-bug-a-grid-too-small-to-fill-the-machine) at two of three lengths.
 
 Same kernels on an **RTX 4090** (RunPod, sm_89, separate session): [RTX 4090 section](#rtx-4090-runpod-2026-08-21). Do not mix T4 and 4090 rows.
 
-Two conclusions in this README were wrong and got corrected by later measurements. Both corrections are in [notes/what_failed.md](notes/what_failed.md): the exact-zero error was **not** a compiler bug, and the fused attention regression was **not** an L2 story.
+Three conclusions in this README were wrong and were corrected by later measurements: the exact-zero error was not a compiler bug, the fused attention regression was not an L2 story, and the fused kernel was not spilling registers. Each correction is logged in [notes/what_failed.md](notes/what_failed.md) with what the wrong reasoning was and what refuted it.
 
-The only difference between these two kernels is which thread index drives the row. (For square M=N=K — the sizes in this table — the two grid expressions evaluate to identical `dim3` values; they would differ for non-square.)
+## Stages 1–2: the same arithmetic, 8.6× apart
 
-Both kernels use `dim3 block(32, 32)`. Coalesced / naive at 4096 is **9.4×** (580.13 / 61.73). That is a bit above the 5–8× rule of thumb because Stage 1 is a *true* uncoalesced mapping, not the accidentally-coalesced kernel that used to sit in `01_naive.cu`.
+The only difference is which thread index drives the row. Both use `dim3 block(32, 32)`; for the square M=N=K sizes here the two grid expressions produce identical `dim3` values. One thread computes one `C[i,j]` with K FMAs either way.
+
+8.6× is above the usual 5–8× rule of thumb because Stage 1 is a *true* uncoalesced mapping, not the accidentally-coalesced kernel that used to sit in `01_naive.cu`.
 
 ## Stages 3–5 (Tesla T4, N=4096)
 
-- **Stage 3 `tiled`:** 725.61 GFLOP/s, **16.8%** of cuBLAS. Only **1.25×** coalesced, not the 2–3× textbook jump. At N=1024 it *lost* (365 vs 623) — working set already in L2, `__syncthreads()` is extra cost. Logged in [notes/what_failed.md](notes/what_failed.md). Left as the teaching kernel; did not tune it to chase Stage 2.
-- **Stage 4 `register`:** 2202 GFLOP/s, **51.5%** of cuBLAS. **3.0×** tiled, **3.8×** coalesced. This is the real reuse jump: each thread holds a 4×4 C patch, each shared value feeds 16 FMAs.
-- **Stage 5 `vectorized`:** 2365 GFLOP/s, **55.6%** of cuBLAS. **+7%** over register (below the 10–30% band, still a real win).
+- **Stage 3 `tiled`:** 656.99 GFLOP/s, **19.2%** of cuBLAS. Only **1.24×** coalesced, not the 2–3× textbook jump. The counters show the reuse is real — global load requests drop **32×** — but 32×32 one-thread-per-output tiling does not raise arithmetic intensity enough to convert it. Left as the teaching kernel; not tuned to chase Stage 2. An earlier session had this stage *losing* to coalesced at N=1024; that did not reproduce, and [notes/what_failed.md](notes/what_failed.md) records why N=1024 measurements on Colab are not trustworthy.
+- **Stage 4 `register`:** 1813.60 GFLOP/s, **54.2%** of cuBLAS. **2.8×** tiled. This is the real reuse jump: each thread holds a 4×4 C patch, so each shared value feeds 16 FMAs.
+- **Stage 5 `vectorized`:** 2046.31 GFLOP/s, **61.5%** of cuBLAS, **+12.8%** over register. The counters say this is an instruction-issue win, not a traffic win: same bytes as Stage 4, a quarter of the requests.
 
 Tiled, register, and vectorized report exactly the same 2048 error as Stages 1–2 (`1.53e-04` / `1.99e-06`, 4,000,760 differing elements, none past tolerance). Identical to the digit, because all five accumulate `k` in the same order — that is the proof the ladder never changed the math, only the memory access pattern.
 
@@ -40,11 +46,11 @@ Tiled, register, and vectorized report exactly the same 2048 error as Stages 1�
 
 | N | Kernel GF/s | cuBLAS FP16 GF/s | % cuBLAS FP16 | Avg ms |
 |---:|---:|---:|---:|---:|
-| 1024 | 2383 | 20126 | 11.8 | 0.90 |
-| 2048 | 2585 | 30760 | 8.4 | 6.65 |
-| 4096 | 4192 | 41512 | 10.1 | 32.79 |
+| 1024 | 4546.95 | 34310.99 | 13.25 | 0.4723 |
+| 2048 | 4369.71 | 40426.42 | 10.81 | 3.9316 |
+| 4096 | 3489.60 | 36415.28 | 9.58 | 39.3853 |
 
-cuBLAS 41.5 TFLOPS at 4096 is ~64% of T4 FP16 Tensor Core peak (~65 TFLOPS). That baseline is healthy. The WMMA kernel is **4.2 TFLOPS, ~10% of that cuBLAS**, about **1.8×** Stage 5's FP32 2.37 TFLOPS. This is a teaching WMMA (no async copy, no double-buffer, 64×64 tile), not 60–80% of cuBLAS FP16. Do not inflate it.
+cuBLAS at 40.4 TFLOPS (N=2048) is ~62% of T4 FP16 Tensor Core peak (~65 TFLOPS), so that baseline is healthy. The WMMA kernel is **3.5–4.5 TFLOPS, roughly 10% of it**, and about **1.7×** Stage 5's FP32 2.05 TFLOPS. This is a teaching WMMA — no async copy, no double buffering, 64×64 tile — not 60–80% of cuBLAS FP16. Do not inflate it.
 
 On T4 this kernel matched `cublasGemmEx` bit for bit at all three sizes. On the 4090 the same kernel differs from cuBLAS in 1.0M / 4.2M / 16.7M elements at max rel 2.1e-06 / 3.2e-06 / 7.1e-06, well inside the 1e-2 gate. Both pass; see [bitwise matches](#about-the-bitwise-matches) for why the T4 zeros are not a checker bug.
 
@@ -52,27 +58,34 @@ Req GB/s in the harness still uses the no-reuse formula `(2MNK+MN)×4`. That num
 
 ### Per-size (same T4 session)
 
-| Stage | N | Kernel GF/s | cuBLAS GF/s | % cuBLAS | Req GB/s | Peak DRAM | Max abs | Max rel |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Naive | 1024 | 60.94 | 6271.39 | 0.97 | 243.87 | 320.06 | 6.87e-05 | 1.27e-06 |
-| Naive | 2048 | 61.85 | 6661.33 | 0.93 | 247.46 | 320.06 | 1.53e-04 | 1.99e-06 |
-| Naive | 4096 | 61.73 | 4170.76 | 1.48 | 246.95 | 320.06 | 0* | 0* |
-| Coalesced | 1024 | 623.19 | 5262.86 | 11.84 | 2493.97 | 320.06 | 6.87e-05 | 1.27e-06 |
-| Coalesced | 2048 | 580.51 | 6271.55 | 9.26 | 2322.62 | 320.06 | 1.53e-04 | 1.99e-06 |
-| Coalesced | 4096 | 580.13 | 4175.41 | 13.89 | 2320.82 | 320.06 | 0* | 0* |
-| Tiled | 1024 | 364.64 | 3049.07 | 11.96 | 1459.29 | 320.06 | 6.87e-05 | 1.27e-06 |
-| Tiled | 2048 | 730.03 | 6396.33 | 11.41 | 2920.83 | 320.06 | 1.53e-04 | 1.99e-06 |
-| Tiled | 4096 | 725.61 | 4320.24 | 16.80 | 2902.81 | 320.06 | 0* | 0* |
-| Register | 1024 | 2622.10 | 5850.92 | 44.82 | 10493.50 | 320.06 | 6.87e-05 | 1.27e-06 |
-| Register | 2048 | 2363.78 | 7182.81 | 32.91 | 9457.42 | 320.06 | 1.53e-04 | 1.99e-06 |
-| Register | 4096 | 2202.43 | 4275.13 | 51.52 | 8810.81 | 320.06 | 0* | 0* |
-| Vectorized | 1024 | 2914.15 | 6255.84 | 46.58 | 11662.30 | 320.06 | 6.87e-05 | 1.27e-06 |
-| Vectorized | 2048 | 2432.24 | 6522.35 | 37.29 | 9731.35 | 320.06 | 1.53e-04 | 1.99e-06 |
-| Vectorized | 4096 | 2364.88 | 4253.37 | 55.60 | 9460.67 | 320.06 | 0* | 0* |
+| Stage | N | Kernel GF/s | cuBLAS GF/s | % cuBLAS | Avg ms | Req GB/s | Max abs | Max rel | Fail elems |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Naive | 1024 | 60.65 | 6293.62 | 0.96 | 35.4094 | 242.71 | 6.87e-05 | 1.27e-06 | 0 |
+| Naive | 2048 | 61.29 | 6367.49 | 0.96 | 280.3112 | 245.21 | 1.53e-04 | 1.99e-06 | 0 |
+| Naive | 4096 | 61.77 | 3453.24 | 1.79 | 2224.8618 | 247.13 | 0* | 0* | 0 |
+| Coalesced | 1024 | 439.02 | 3617.94 | 12.13 | 4.8915 | 1756.94 | 6.87e-05 | 1.27e-06 | 0 |
+| Coalesced | 2048 | 530.28 | 6535.73 | 8.11 | 32.3978 | 2121.63 | 1.53e-04 | 1.99e-06 | 0 |
+| Coalesced | 4096 | 530.21 | 3405.89 | 15.57 | 259.2149 | 2121.11 | 0* | 0* | 0 |
+| Tiled | 1024 | 764.43 | 6024.46 | 12.69 | 2.8093 | 3059.22 | 6.87e-05 | 1.27e-06 | 0 |
+| Tiled | 2048 | 646.28 | 7017.24 | 9.21 | 26.5828 | 2585.74 | 1.53e-04 | 1.99e-06 | 0 |
+| Tiled | 4096 | 656.99 | 3425.90 | 19.18 | 209.1946 | 2628.28 | 0* | 0* | 0 |
+| Register | 1024 | 2989.25 | 6071.66 | 49.23 | 0.7184 | 11962.82 | 6.87e-05 | 1.27e-06 | 0 |
+| Register | 2048 | 1887.46 | 6101.76 | 30.93 | 9.1021 | 7551.68 | 1.53e-04 | 1.99e-06 | 0 |
+| Register | 4096 | 1813.60 | 3348.51 | 54.16 | 75.7825 | 7255.27 | 0* | 0* | 0 |
+| Vectorized | 1024 | 2922.75 | 6150.01 | 47.52 | 0.7347 | 11696.69 | 6.87e-05 | 1.27e-06 | 0 |
+| Vectorized | 2048 | 2073.36 | 6289.78 | 32.96 | 8.2860 | 8295.47 | 1.53e-04 | 1.99e-06 | 0 |
+| Vectorized | 4096 | 2046.31 | 3328.22 | 61.48 | 67.1643 | 8186.24 | 0* | 0* | 0 |
+| WMMA | 1024 | 4546.95 | 34310.99 | 13.25 | 0.4723 | 9102.78 | 0* | 0* | 0 |
+| WMMA | 2048 | 4369.71 | 40426.42 | 10.81 | 3.9316 | 8743.69 | 0* | 0* | 0 |
+| WMMA | 4096 | 3489.60 | 36415.28 | 9.58 | 39.3853 | 6980.90 | 0* | 0* | 0 |
 
-\* Bitwise match against cuBLAS at this size. Explained below.
+\* Bitwise match against cuBLAS at this size. [Explained below.](#about-the-bitwise-matches)
 
-cuBLAS GF/s at 1024 moved 6271 → 5262 between the two process runs. That is boost/clock noise, not a kernel bug. Prefer the 4096 % of cuBLAS (same ~4170 GF/s both times).
+Two things to read carefully in this table.
+
+**cuBLAS FP32 drops to ~3400 GF/s at 4096 but sits near 6100–7000 at 1024 and 2048.** That is consistent across all five stages within the session, so it is not a per-kernel effect. The likely cause is thermal: the N=4096 cuBLAS run always follows the custom kernel at 4096, and for naive that means 13 launches of a 2.2-second kernel — about 29 seconds at full load — immediately beforehand. Treat the 4096 `% cuBLAS` column as flattered, and prefer the 2048 column when quoting a single ratio.
+
+**Absolute numbers differ from earlier sessions on this repo.** A previous Colab T4 reported cuBLAS ~4170 GF/s at 4096 and Stage 5 at 2365. Different VM, different clocks. The *ratios* held across both sessions (fused v1 speedup 1.47× then, 1.48× now), which is why ratios are what get quoted and why this table was replaced wholesale rather than merged.
 
 ## About the bitwise matches
 
@@ -92,31 +105,67 @@ Two columns come out of this. **Diff elems** counts elements that differ at all,
 
 A CUDA warp is 32 consecutive `threadIdx.x` values (same `threadIdx.y` in a 32×32 block). Global memory coalesces when those 32 threads hit a contiguous 128-byte span (4 × 32-byte sectors).
 
-- **Naive (uncoalesced):** `threadIdx.x` is the row, `threadIdx.y` is the column. Adjacent warp threads write `C[row+i][col]` — N floats apart — so the C store (and the A load) issue ~32 sectors per request instead of 4.
-- **Coalesced:** `threadIdx.x` is the column, `threadIdx.y` is the row. Adjacent warp threads write `C[row][col+i]` — consecutive addresses — so the C store (and the B load) collapse into one 128-byte transaction.
+- **Naive (uncoalesced):** `threadIdx.x` is the row, `threadIdx.y` is the column. Adjacent warp threads write `C[row+i][col]` — N floats apart — so the C store and the A load issue 32 sectors per request instead of 4.
+- **Coalesced:** `threadIdx.x` is the column, `threadIdx.y` is the row. Adjacent warp threads write `C[row][col+i]` — consecutive addresses — so the C store and the B load collapse into one 128-byte transaction.
 
-Arithmetic is identical: one thread, one `C[i,j]`, K FMAs from global memory.
+Arithmetic is identical: one thread, one `C[i,j]`, K FMAs from global memory. Both predictions are [confirmed by the counters](#measured-memory-behaviour-nsight-compute-t4) at 16.5 and 2.5 sectors per request.
 
 **Req GB/s** is requested traffic `(2·M·N·K + M·N) × 4` bytes over kernel time — not DRAM bandwidth. Both stages request the same byte count, so the stage-to-stage GB/s ratio equals the GFLOP/s ratio. The useful comparison is against the 320 GB/s DRAM peak:
 
 - Naive sits at ~247 GB/s **below** peak. The kernel is latency-bound on uncoalesced 32-sector transactions, so wall-clock stretches and bytes/time look small.
-- Coalesced sits at ~2320 GB/s, about **7×** peak. That is L1/L2 answering reuse the kernel does not express (each A row is reread across columns; each B column is reread across rows). Not a measurement bug.
+- Coalesced sits at ~2120 GB/s, about **6.6×** peak. That is L1/L2 answering reuse the kernel does not express (each A row is reread across columns; each B column is reread across rows). Not a measurement bug.
 
-## Profiling without Nsight counters
+## Measured memory behaviour (Nsight Compute, T4)
 
-`ncu` was run on Colab T4 and on RunPod RTX 4090 **as root** with Nsight Compute 2025.1.1. Both printed:
+Nsight Compute **does** work on Colab T4. It was denied on RunPod (`ERR_NVGPUCTRPERM`), which is a container privilege policy rather than anything about the kernels — see [notes/what_failed.md](notes/what_failed.md). All figures below are `ncu --launch-count 1` at N=1024, collected by [`scripts/run_all.sh`](scripts/run_all.sh).
 
-`ERR_NVGPUCTRPERM - The user does not have permission to access NVIDIA GPU Performance Counters`
+| Stage | Global load requests | Sectors | Sectors/req | L1 load traffic | Achieved occupancy |
+|---|---:|---:|---:|---:|---:|
+| Naive | 67,108,864 | 1,107,296,256 | **16.5** | 35.4 GB | 98.1% |
+| Coalesced | 67,108,864 | 167,772,160 | **2.5** | 5.37 GB | 98.5% |
+| Tiled | 2,097,152 | 8,388,608 | 4.0 | 268 MB | 100.0% |
+| Register blocked | 1,048,576 | 4,145,178 | 3.95 | 133 MB | 66.6% |
+| Vectorized | 262,144 | 4,107,656 | 15.67 | 131 MB | 81.6% |
 
-No `.ncu-rep` files were produced, so **sectors per request is not measured anywhere in this repo**. Root inside a container is not host privilege; this needs `NVreg_RestrictProfiling=0` on the host or a privileged VM.
+### The counts reproduce the hand model exactly
 
-What does work without those counters, and is wired into the harness:
+Not approximately — to the digit. A naive warp issues, per k-iteration, one A load across 32 different rows (32 sectors) and one broadcast B load (1 sector), so 1024 iterations × 33 sectors × 32,768 warps = 1,107,296,256. Measured: 1,107,296,256. Coalesced turns that into a broadcast A (1 sector) and a contiguous B (4 sectors): 1024 × 5 × 32,768 = 167,772,160. Measured: 167,772,160.
 
-- `-Xptxas -v` at compile time: registers per thread, static shared memory, and **spill store/load bytes** per kernel. This is what showed the fused attention v1 spill.
-- `cudaFuncGetAttributes` and `cudaOccupancyMaxActiveBlocksPerMultiprocessor` at runtime: blocks per SM and theoretical occupancy. Both `bench` and `bench_attn` print an occupancy table before their results.
-- `nsys` uses CUPTI tracing rather than the restricted counters and is attempted in [scripts/run_all.sh](scripts/run_all.sh).
+The tiling stages check out the same way. A 32×32 tile means each block reads `(32×1024 + 1024×32) × 4` = 256 KB, times 1024 blocks = 256 MB against 268 MB measured. A 64×64 tile reads 512 KB per block across 256 blocks = 128 MB against 133 MB measured.
 
-If a privileged host ever becomes available, the number to collect is kernel-average sectors/request, expected around 16.5 for naive against 2.5 for coalesced. Until then the coalescing claim rests on wall-clock: **9.4×** on T4, **8.2×** on 4090.
+### Coalescing fixes sector efficiency; tiling fixes request count
+
+These are different optimizations and the counters separate them cleanly.
+
+Stage 2 leaves the request count untouched at 67.1M and cuts sectors per request by 6.6×. Everything after Stage 2 does the opposite: sectors per request stops improving, while requests collapse 67.1M → 2.1M → 1.05M → 262K, a **256× reduction**. Total L1 load traffic falls from 35.4 GB to 131 MB against a floor of 8 MB, which is what reading A and B exactly once would cost. That remaining 16× is the reuse gap between this ladder and cuBLAS.
+
+### Sectors per request is not a lower-is-better metric
+
+It only means anything relative to the access width. A perfectly coalesced `float` load is 4 sectors (32 lanes × 4 B = 128 B); a perfectly coalesced `float4` load is 16. So:
+
+- Naive at 16.5 against an ideal of 4 is **4.1× wasted**.
+- Coalesced at 2.5 beats 4 because its A load is a broadcast, costing 1 sector.
+- Vectorized at 15.67 against an ideal of 16 is **optimal**, not a regression.
+
+Stage 5 moves the same bytes as Stage 4 (131 vs 133 MB) using a quarter of the requests. That is precisely why `float4` bought only +12.8% here: there was no traffic left to save, only instruction issue. Anyone reading this column as lower-is-better would file Stage 5 as a bug.
+
+### Occupancy runs inverse to performance
+
+Naive and coalesced sit at 98%+ achieved occupancy and are the two slowest kernels in the ladder. Register blocking achieves 66.6% and is **30× faster than naive**. The two fastest stages have the two lowest occupancies.
+
+Occupancy measures how many warp slots are filled, not how much work each warp retires. Register blocking deliberately trades occupancy for per-thread work: 72 registers and a 4×4 C patch per thread mean fewer resident warps, each doing 16 FMAs per shared-memory value. "Raise occupancy" is the reflex answer and this table is the counterexample.
+
+The one place occupancy *was* the whole story is fused attention v1, below — and there the failure was not the occupancy percentage but the grid being too small to fill a single wave.
+
+### Compile-time and runtime facts that need no counters
+
+Still wired in, and the only profiling available on RunPod:
+
+- `-Xptxas -v` reports registers, shared memory, and spill bytes per kernel at compile time.
+- `cudaFuncGetAttributes` and `cudaOccupancyMaxActiveBlocksPerMultiprocessor` give theoretical occupancy at runtime. Both `bench` and `bench_attn` print a table before their results.
+- `nsys` uses CUPTI tracing rather than the restricted counters, and is attempted in `run_all.sh`. It is not installed in the Colab image.
+
+Timings printed *under* `ncu` are inflated by serialized replay and must not be quoted: the same attention run reported 5.02 ms unfused under the profiler against 2.98 ms clean, and v1 flipped from winning to losing. Counters from profiled runs, wall-clock from unprofiled ones.
 
 ## Project layout
 
@@ -168,25 +217,28 @@ c++ -O3 -std=c++17 tests/test_fused_attention_math.cpp -o test_attn_math && ./te
 
 The first proves the correctness checker catches a single wrong element in a 4096² buffer at `-O3`. The second simulates the fused v2 recurrence — warp per Q row, per-tile max, single rescale — against an FP64 reference at nine sequence lengths including the tile and block tails.
 
-## Week 4 — Fused vs unfused attention (Tesla T4)
+## Fused vs unfused attention (Tesla T4)
 
-Single-head SDPA, `head_dim=64`, batch=1. Unfused is three kernels with a `seq×seq` score matrix in global memory. Fused is one kernel with online softmax (FlashAttention recurrence) and 32×64 K/V tiles in shared memory. Sequence length capped at 1024.
+Single-head SDPA, `head_dim=64`, batch=1. Unfused is three kernels with a `seq×seq` score matrix in global memory. Fused is one kernel with the online-softmax (FlashAttention) recurrence and 32×64 K/V tiles in shared memory.
 
-FLOPs counted as `4·seq·seq·d` (QKᵀ + PV). Softmax is extra work, not in the GFLOP/s numerator. Host-side fused vs unfused compare (not the GEMM device checker).
+FLOPs counted as `4·seq·seq·d` (QKᵀ + PV). Softmax is extra work, not in the GFLOP/s numerator. The compare is host-side fused against unfused, not the GEMM device checker.
 
-| seq | Unfused ms | Fused ms | Speedup | Unfused GF/s | Fused GF/s | S MiB | Max abs | Max rel |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 256 | 0.555 | 0.829 | **0.67×** | 30.2 | 20.2 | 0.25 | 1.19e-07 | 9.59e-07 |
-| 512 | 1.523 | 1.639 | **0.93×** | 44.1 | 41.0 | 1.00 | 1.42e-07 | 1.48e-06 |
-| 1024 | 4.894 | 3.328 | **1.47×** | 54.9 | 80.7 | 4.00 | 1.15e-07 | 1.97e-06 |
+| seq | Unfused ms | v1 ms | **v2 ms** | v1 speedup | **v2 speedup** | v2/v1 | Unfused GF/s | **v2 GF/s** | Max abs |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 256 | 0.3342 | 0.4982 | **0.0340** | 0.67× | **9.83×** | 14.7× | 50.2 | **493.7** | 1.12e-07 |
+| 512 | 0.9206 | 0.9893 | **0.1088** | 0.93× | **8.46×** | 9.1× | 72.9 | **616.6** | 1.34e-07 |
+| 1024 | 2.9752 | 2.0108 | **0.3508** | 1.48× | **8.48×** | 5.7× | 90.2 | **765.2** | 1.19e-07 |
 
-Nothing past tolerance at any size, abs error ~1e-7. That is a real host copy, not the GEMM device checker.
+Nothing past tolerance at any size, abs error ~1e-7.
 
-**The explanation originally given here was wrong.** It read: T4 L2 is 4 MiB, the score matrix is 0.25 / 1.00 / 4.00 MiB, so fusion only pays once the working set exceeds L2. That effect exists, but it is not why this kernel was slow, and the correction is the interesting part. See the next section.
+**v2 wins at every sequence length, and wins hardest at the shortest one.** That last part matters: it is what disproves the explanation this section used to give.
 
-## The fused attention bug: 32 warps on a 128-SM GPU
+## The fused attention bug: a grid too small to fill the machine
 
-The 4090 numbers are what exposed it. Fused was **0.38× / 0.37× / 0.45×** there — *worse* than on the T4. A cache-capacity story predicts the opposite, so the cache story was wrong.
+The original v1 write-up blamed cache capacity — T4 L2 is 4 MiB, the score matrix is 0.25 / 1.00 / 4.00 MiB, so fusion supposedly only pays once the working set exceeds L2, producing a crossover at seq=1024. Plausible, and wrong. Two things killed it:
+
+1. On the 4090 (72 MiB L2), v1 was **worse**, not better: 0.38× / 0.37× / 0.45×. A cache-capacity story predicts a bigger cache helps the materializing path, not that it hurts the fused one by more.
+2. v2 removes the crossover entirely and is *best* at seq=256, where the score matrix is 0.25 MiB and comfortably resident. If L2 capacity were the mechanism, seq=256 is exactly where fusion should have the least to offer.
 
 `launchFusedAttention` was:
 
@@ -194,43 +246,52 @@ The 4090 numbers are what exposed it. Fused was **0.38× / 0.37× / 0.45×** the
 fusedAttentionKernel<<<(seq + 31) / 32, 32>>>(...);  // one thread per Q row
 ```
 
-At seq=1024 that is **32 blocks of one warp — 32 warps for the whole GPU**. On a 128-SM 4090, 96 SMs had no work at all and the rest ran a single warp with nothing to hide latency behind. The unfused path meanwhile launches 1024 blocks of 1024 threads. The benchmark was never measuring fusion against materialization; it was measuring a well-parallelized three-kernel path against a kernel using a fraction of a percent of the machine.
-
-Each thread also carried `acc[64]` and `s[32]`, and the `s[]` loops are bounded by a runtime tile length, so that array cannot live in registers. `-Xptxas -v` reports the spill directly.
+At seq=1024 that is **32 blocks of one warp**. The unfused path meanwhile launches 1024 blocks of 1024 threads. The benchmark was never comparing fusion against materialization; it was comparing a well-parallelized three-kernel path against a kernel that could not fill the GPU.
 
 ### v2: one warp per Q row
 
-[`src/09_attention_fused_v2.cu`](src/09_attention_fused_v2.cu), same online-softmax math, different thread mapping:
+[`src/09_attention_fused_v2.cu`](src/09_attention_fused_v2.cu) keeps the online-softmax math identical and changes only the thread mapping.
 
-| | v1 | v2 |
-|---|---|---|
-| Q rows per | thread | warp |
-| Block | 32 threads | 128 threads (4 warps, 4 Q rows) |
-| Blocks at seq=1024 | 32 | 256 |
-| **Warps at seq=1024** | **32** | **1024** |
-| Per-thread accumulator | `acc[64]` + `s[32]` | 2 floats |
+| | v1 | v2 | |
+|---|---:|---:|---:|
+| Q rows per | thread | warp | |
+| Block | 32 threads | 128 threads (4 warps) | |
+| Blocks at seq=1024 | 32 | 256 | |
+| Warps at seq=1024 | 32 | 1024 | 32× |
+| Registers / thread | 189 | 66 | |
+| Shared memory / thread | 520 B | 142 B | |
+| Theoretical occupancy | 9.4% | 37.5% | 4.0× |
+| **Achieved occupancy** | **3.12%** | **33.19%** | **10.6×** |
+| **Waves per SM** | **0.27** | **2.13** | **7.9×** |
+| Measured speedup at seq=1024 | — | — | **5.7×** |
 
-head_dim 64 across 32 lanes gives each lane two accumulator floats, which is what removes the spill. Inside a tile, lane `j` owns K row `j` and computes the whole 64-long dot from shared memory, so `s_j` stays in a register and the dot needs no shuffle at all; only the two softmax reductions across the 32 K rows use `__shfl_xor_sync`. `tile_k` and `tile_v` are padded to 65 floats per row so that `(j*65 + d) % 32 == (j + d) % 32` and the lane-varying reads hit 32 distinct banks.
+The last three rows are `ncu`; the rest are `-Xptxas -v` and the occupancy API.
 
-v1 stays in the binary. `./bench_attn` runs unfused, v1, and v2 side by side and prints the occupancy table for all three, so the before/after is measured rather than described.
+**Two limiters were stacked, and the gap between theoretical and achieved occupancy separates them.** v2 realizes 88% of its theoretical occupancy (33.19 of 37.5). v1 realizes only 33% of its own (3.12 of 9.4), and `launch__waves_per_multiprocessor = 0.27` says why: with 32 blocks across 40 SMs, 8 SMs got no work at all and v1 never reached the 3 blocks/SM the hardware would have allowed. So the grid was too small *and* the per-thread footprint was too large — v1 asked for 16,640 bytes of shared memory to be used by 32 threads.
 
-```bash
-bash scripts/run_all.sh          # builds both binaries with -Xptxas -v, runs everything
-```
+A 10.6× occupancy gain converting to a 5.7× speedup is the honest number. v2 buys its parallelism with shared-memory traffic and two warp-shuffle reductions per tile, so roughly half the theoretical gain shows up in wall-clock.
+
+### What changed in the kernel
+
+head_dim 64 across 32 lanes gives each lane two accumulator floats, replacing `acc[64]`. Inside a tile, lane `j` owns K row `j` and computes the whole 64-long dot from shared memory, so `s_j` stays in a register and the dot needs no shuffle; only the tile max and the sum reduce across lanes. `tile_k` and `tile_v` are padded to 65 floats per row so that `(j*65 + d) % 32 == (j + d) % 32`, putting the lane-varying reads on 32 distinct banks.
+
+v1 stays in the binary. `./bench_attn` runs unfused, v1, and v2 side by side, so the before and after is measured rather than remembered.
 
 ### CUDA vs Triton (SGEMM, same T4 session)
 
-Triton tiled matmul (`triton/matmul.py`, 64×64×32, `tl.dot`) vs `torch.matmul` (cuBLAS). Same 2N³ GFLOP formula as the C++ harness.
+Triton tiled matmul (`triton/matmul.py`, 64×64×32) against `torch.matmul`. Both sides pinned to IEEE FP32 (`input_precision="ieee"`, `allow_tf32=False`), same 2N³ GFLOP formula as the C++ harness.
 
 | N | Triton ms | torch.matmul ms | Triton GF/s | torch GF/s | % torch | Max abs |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1024 | 0.675 | 0.523 | 3181 | 4105 | 77.5 | 7.63e-05 |
-| 2048 | 4.743 | 3.888 | 3622 | 4419 | 82.0 | 1.60e-04 |
-| 4096 | 39.93 | 32.25 | 3442 | 4262 | 80.8 | 0* |
+| 1024 | 1.0957 | 0.8332 | 1959.9 | 2577.4 | 76.0 | 7.63e-05 |
+| 2048 | 7.7177 | 6.0385 | 2226.0 | 2845.0 | 78.2 | 1.60e-04 |
+| 4096 | 52.0548 | 40.7782 | 2640.3 | 3370.4 | 78.3 | 0* |
 
 \* Bitwise match at N=4096, same cause as the C++ harness. Quote the 2048 error.
 
-torch.matmul 4262 GF/s matches the C++ cuBLAS row (~4253 on vectorized). Triton is **~81% of cuBLAS** at 4096 vs Stage 5 CUDA **55.6%**. About 80 lines of Python beat the five-stage FP32 ladder (3442 vs 2365 GF/s). That is the productivity-versus-control point: Triton won on this GPU, and the CUDA ladder is how you see why. `tl.dot` is genuinely FP32 here because the T4 has no TF32 path — do not mix this 81% with Stage 6's 10% of FP16 cuBLAS.
+Triton reaches **78.3% of cuBLAS** at 4096 against Stage 5's **61.5%**, and beats the five-stage CUDA ladder outright (2640 vs 2046 GF/s) in about 80 lines of Python. That is the productivity-versus-control point: Triton won on this GPU, and the CUDA ladder is how you see why.
+
+Running with `--tf32` on the T4 produces byte-identical error (7.63e-05 / 1.60e-04) and the same ~78% ratio, which is the expected result — sm_75 has no TF32 path, so the flag is a no-op. The flag exists because on Ada it is [emphatically not](#triton-4090--tf32-not-fp32).
 
 ## RTX 4090 (RunPod, 2026-08-21)
 
@@ -285,7 +346,7 @@ cuBLAS FP32 ~58.8 TFLOPS is a healthy 4090 baseline. Coalesced/naive is **8.2×*
 | 512 | 0.251 | 0.671 | **0.37×** | 267.1 | 100.1 | 1.42e-07 |
 | 1024 | 0.607 | 1.340 | **0.45×** | 442.1 | 200.3 | 1.15e-07 |
 
-Fused v1 lost at every sequence length, and lost *harder* here than on the T4. That is the observation that killed the L2 explanation and led to [the occupancy bug](#the-fused-attention-bug-32-warps-on-a-128-sm-gpu): on a 128-SM GPU, a kernel launching 32 warps has further to fall. v2 numbers go here after the next 4090 session; v1 rows stay for the comparison.
+Fused v1 lost at every sequence length, and lost *harder* here than on the T4. That is the observation that killed the L2 explanation and led to [the grid-size bug](#the-fused-attention-bug-a-grid-too-small-to-fill-the-machine): on a 128-SM GPU, a kernel launching 32 warps has further to fall. v2 numbers go here after the next 4090 session; v1 rows stay for the comparison.
 
 Host-side compare: nothing past tolerance, same ~1e-7 abs as T4.
 

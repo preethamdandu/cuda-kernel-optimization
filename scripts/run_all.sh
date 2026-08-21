@@ -84,11 +84,44 @@ else
 fi
 echo
 
-echo "=== ncu (expected to be denied; recorded so the wall is documented) ==="
+echo "=== ncu hardware counters ==="
+# Colab T4 allows these; RunPod denied them with ERR_NVGPUCTRPERM. Either
+# outcome is worth recording, so nothing here is fatal.
 if command -v ncu >/dev/null; then
-  ncu --metrics l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum \
-    --kernel-name regex:naiveSgemmKernel --launch-count 1 \
-    ./bench --stage naive --sizes 1024 2>&1 | grep -E "ERR_|sectors|requests" || true
+  LOAD_METRICS=l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum,sm__warps_active.avg.pct_of_peak_sustained_active
+
+  echo "--- sectors per request, all FP32 stages at N=1024 ---"
+  echo "naive should be ~16.5 (32 uncoalesced A sectors + 1 broadcast B, halved)."
+  echo "coalesced should be ~2.5. Perfect coalescing is 4 for float, 16 for float4,"
+  echo "so vectorized near 16 is optimal, not a regression."
+  for pair in naive:naiveSgemmKernel \
+              coalesced:coalescedSgemmKernel \
+              tiled:tiledSgemmKernel \
+              register:registerBlockedSgemmKernel \
+              vectorized:vectorizedSgemmKernel; do
+    stage=${pair%%:*}
+    kernel=${pair##*:}
+    echo "--- $stage ---"
+    ncu --metrics "$LOAD_METRICS" \
+      --kernel-name "regex:$kernel" --launch-count 1 \
+      ./bench --stage "$stage" --sizes 1024 2>&1 |
+      grep -E "ERR_|l1tex__|sm__warps_active" || echo "(no counter output for $stage)"
+  done
+  echo
+
+  echo "--- achieved occupancy, fused attention v1 vs v2 at seq=1024 ---"
+  # Separate invocations: v1 runs 13 times before v2 starts, so a regex
+  # matching both only ever reports v1.
+  for kernel in fusedAttentionKernel fusedAttentionV2Kernel; do
+    echo "--- $kernel ---"
+    ncu --metrics sm__warps_active.avg.pct_of_peak_sustained_active,launch__waves_per_multiprocessor \
+      --kernel-name "regex:^$kernel\$" --launch-count 1 \
+      ./bench_attn --seqs 1024 2>&1 |
+      grep -E "ERR_|sm__warps_active|launch__waves" || echo "(no counter output for $kernel)"
+  done
+  echo
+  echo "Timings printed under ncu are inflated by profiling and must not be quoted."
+  echo "Quote wall-clock from the unprofiled runs above."
 else
   echo "ncu not installed in this image."
 fi

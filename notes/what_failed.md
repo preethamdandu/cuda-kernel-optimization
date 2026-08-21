@@ -69,7 +69,13 @@ This file tracks dead ends, wrong assumptions, and regressions during kernel opt
 - Root cause: one-thread-per-output 32×32 tiling still loads every A/B element from global once per output row/col of the *block*, but at N=1024 the coalesced kernel already streams from L2. Tiling adds two `__syncthreads()` per K-chunk and extra shared round-trips without enough extra reuse. The 2–3× textbook jump needs register blocking, not this tile size.
 
 ### Next move
-- Leave Stage 3 as the teaching kernel. Do not retune it to beat Stage 2. Stage 4 (4×4 per thread) is the actual 3.8× jump.
+- Leave Stage 3 as the teaching kernel. Do not retune it to beat Stage 2. Stage 4 (4×4 per thread) is the actual jump.
+
+### Update — the N=1024 loss did not reproduce
+- A later full T4 session had tiled **beating** coalesced at every size: 764 vs 439 at 1024, 646 vs 530 at 2048, 657 vs 530 at 4096. The 0.58× is not a stable finding.
+- Both sessions agree that N=1024 is where the measurements are least trustworthy. Coalesced at 1024 alone read 623, 439, and 513 GF/s across three runs on the same code — a 1.4× spread from clocks and cache state on a shared Colab VM. The 4096 numbers are stable to within a percent.
+- What *is* stable, and is now measured, is the mechanism: tiling cuts global load requests **32×** (67.1M → 2.1M at N=1024) while leaving sectors-per-request at the coalesced ideal of 4. So the shared-memory reuse is real and doing exactly what it should. What it does not buy is enough arithmetic intensity per thread to matter, which is Stage 4's job.
+- Lesson: a single-session ratio at the smallest problem size is not a result. Quote 4096, or quote a range across sessions.
 
 ## 2026-08-21 — Fused attention lost at seq=256 and 512
 
@@ -82,26 +88,60 @@ This file tracks dead ends, wrong assumptions, and regressions during kernel opt
 - Evidence: host-side compare passed at all sizes (max abs ~1e-7, 0 differing elements past tolerance). Timing is real.
 
 ### Why it failed
-- Written up at the time as an L2 story: T4 L2 is 4 MiB, unfused scores are 0.25 / 1.00 / 4.00 MiB, so fusion only starts avoiding real DRAM traffic at 1024. That effect is real but it is **not** the main term. See the entry below — the kernel was launching one warp per block.
+- Written up at the time as an L2 story: T4 L2 is 4 MiB, unfused scores are 0.25 / 1.00 / 4.00 MiB, so fusion only starts avoiding real DRAM traffic at 1024. See the entry below — the kernel was launching one warp per block.
+- The v2 measurements retired the L2 argument outright rather than demoting it. v2 wins **9.83×** at seq=256, its *largest* margin, at the size where the score matrix is 0.25 MiB and trivially L2-resident. If cache capacity were the mechanism, 256 is exactly where fusion should have had the least to offer.
 
 ### Next move
 - Superseded by the v2 rewrite. Kept here because the original conclusion was wrong and the correction is the point.
 
-## 2026-08-21 — ncu ERR_NVGPUCTRPERM on Colab T4 and RunPod 4090
+## 2026-08-21 — ncu ERR_NVGPUCTRPERM on RunPod 4090, then it worked on Colab T4
 
 ### Attempt
 - Stage: Week 3 profiling.
-- Change tried: `ncu --metrics l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,... --kernel-name regex:naiveSgemmKernel --launch-count 1` (and coalesced / register) as **root** on RunPod RTX 4090, Nsight Compute 2025.1.1, CUDA 12.8. Same metrics on Colab T4 earlier.
+- Change tried: `ncu --metrics l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,... --kernel-name regex:naiveSgemmKernel --launch-count 1` (and coalesced / register) as **root** on RunPod RTX 4090, Nsight Compute 2025.1.1, CUDA 12.8.
 
 ### What happened
-- Symptom: `==ERROR== ERR_NVGPUCTRPERM - The user does not have permission to access NVIDIA GPU Performance Counters on the target device 0.`
-- Evidence: no `profiles/*.ncu-rep` files (`Could not open report file`). Bench still printed GFLOP/s; only counters were denied. RunPod image: `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`.
+- On RunPod: `==ERROR== ERR_NVGPUCTRPERM - The user does not have permission to access NVIDIA GPU Performance Counters on the target device 0.` No `profiles/*.ncu-rep` files. Bench still printed GFLOP/s; only counters were denied. Image: `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`.
+- An earlier Colab attempt was also recorded as denied, and I generalized that into "counters are denied on every platform," which went into the README as a standing limitation.
+- **On Colab T4, re-running the same metrics through `scripts/run_all.sh` returned real counters.** Every stage, first try, no flags changed.
 
 ### Why it failed
-- Root cause: the NVIDIA driver in the container/hypervisor has profiling restricted (`RmProfilingAdminOnly` / guest counter policy). Root inside the pod is not host privilege. Same class of wall as Colab, not a bad `ncu` flag.
+- RunPod's root cause is real: the driver in that container has profiling restricted (`RmProfilingAdminOnly` / guest counter policy), and root inside a pod is not host privilege.
+- The mistake was the generalization. Two denials on two platforms became "denied everywhere," and the README then justified having no profiling evidence at all rather than retrying the cheap platform. The free environment worked the whole time.
 
 ### Next move
-- Do not rent another 4090 for the same command. Sectors/request needs a **privileged** VM or host `NVreg_RestrictProfiling=0`. Until then the coalescing claim is the 8.2× wall-clock (4090) / 9.4× (T4), not ncu.
+- Sector counts and achieved occupancy for every kernel now come from Colab, and are in the README under "Measured memory behaviour." RunPod is for the 4090 wall-clock only.
+- Keep the `ncu` block in `run_all.sh` non-fatal so both outcomes get recorded per platform instead of being assumed.
+
+### Lesson
+- A platform limitation is a claim about a specific platform. "It failed here" and "it fails everywhere" needed one more free retry to separate, and that retry produced the strongest evidence in the repo.
+
+## 2026-08-21 — Predicted a register spill; ptxas says zero
+
+### Attempt
+- Stage: diagnosing why fused attention v1 was slow, before writing v2.
+- Claim made: v1 keeps `float acc[64]` plus `float s[32]` per thread, and the `s[]` loops are bounded by a runtime `tile` rather than a constant, so the array cannot be register-allocated and must spill to local memory. This was written into the README and this log as a root cause **alongside** the occupancy argument.
+
+### What happened
+- Added `-Xptxas -v` specifically to prove it. It reported the opposite:
+
+```
+fusedAttentionKernel: 0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+                      Used 189 registers, 16640 bytes smem
+```
+
+- `cudaFuncGetAttributes` agrees: `localSizeBytes = 0`. No spill at any point.
+
+### Why it failed
+- The compiler fully unrolled the tile loops and kept all 96 floats in registers, at the cost of 189 registers per thread — high, but under the 255 cap, so no spill was needed.
+- The occupancy half of the diagnosis was right and the mechanism was wrong. v1's real limiters, both now measured: only 32 blocks for 40 SMs (`launch__waves_per_multiprocessor = 0.27`, so 8 SMs idle and the resident blocks never reach the 3/SM the hardware allows), and 16,640 bytes of shared memory requested by a 32-thread block, which is 520 bytes per thread.
+- Achieved occupancy 3.12% against 9.4% theoretical. v2 gets 33.19% against 37.5%.
+
+### Next move
+- Delete "spill" from the README's three references to it and quote registers, shared-memory-per-thread, and waves/SM instead. v2 still wins for the reason predicted, just not by the mechanism predicted.
+
+### Lesson
+- This is the third time in this project a plausible mechanism got asserted before it was measured, and the second time the tool added to prove a claim is what refuted it. Register pressure and register *spilling* are different failure modes with different fixes; 189 registers with no spill would have been a real problem on a kernel that had enough blocks to care.
 
 ## 2026-08-21 — 32×32 tiling lost to coalesced at every size on 4090
 
@@ -141,7 +181,8 @@ This file tracks dead ends, wrong assumptions, and regressions during kernel opt
 ### What happened
 - `launchFusedAttention` was `fusedAttentionKernel<<<(seq + 31) / 32, 32>>>`: **one thread per Q row, 32 threads per block**. At seq=1024 that is 32 blocks of one warp — **32 warps for the entire GPU**. A 4090 has 128 SMs, so 96 of them were idle for the whole kernel, and the 32 that had work ran a single warp each with no latency hiding.
 - Meanwhile the unfused path launches `qkKernel` with 1024 blocks of 1024 threads. So the measurement was never "fusion versus materialization." It was "a well-parallelized three-kernel path versus a kernel that used a quarter of one percent of the machine."
-- Each thread also held `acc[64]` plus `s[32]`, and the `s[]` loops are bounded by a runtime `tile`, so that array cannot stay in registers. `-Xptxas -v` now reports the spill directly.
+- Each thread also held `acc[64]` plus `s[32]`. I predicted this spilled to local memory; `-Xptxas -v` later showed it does not — 189 registers, zero spill. See the separate entry on that. The per-thread cost that *does* bite is shared memory: 16,640 bytes for a 32-thread block, 520 bytes per thread.
+- Measured on T4 once `ncu` was working: v1 achieves **3.12%** occupancy against 9.4% theoretical, at **0.27 waves per SM**. Under one wave means the grid cannot cover the GPU even once, which is why v1 falls short of its own theoretical ceiling. v2 achieves 33.19% against 37.5% theoretical at 2.13 waves/SM.
 
 ### Why it failed
 - I reached for an architectural explanation (cache hierarchy) for a number that had a launch-configuration cause. The L2 argument was plausible enough to stop the investigation, which is exactly what made it expensive. Two GPUs disagreeing in the *wrong direction* was the clue: a bigger, faster GPU making a kernel relatively worse points at parallelism, not at caches.
@@ -152,6 +193,11 @@ This file tracks dead ends, wrong assumptions, and regressions during kernel opt
 - `tile_k` and `tile_v` are padded to 65 floats per row: `(j * 65 + d) % 32 == (j + d) % 32`, so the lane-varying reads hit 32 distinct banks.
 - v1 is kept in the binary and benchmarked next to v2, so the occupancy table and the speedup are side by side rather than described from memory.
 - `tests/test_fused_attention_math.cpp` simulates the v2 recurrence on the host and checks it against an FP64 reference at seq 1, 3, 32, 33, 64, 100, 128, 129, 256, plus a large-logit case that forces the rescale path. That validates the algorithm without a GPU.
+
+### Result (T4, measured)
+- **9.83× / 8.46× / 8.48×** over unfused at seq 256 / 512 / 1024, against v1's 0.67× / 0.93× / 1.48×. Fusion now wins everywhere, and by the most at the shortest sequence.
+- 765 GFLOP/s at seq=1024 against unfused's 90.
+- A 10.6× achieved-occupancy gain converted into a 5.7× speedup over v1. v2 pays for its parallelism in shared-memory traffic and two warp-shuffle reductions per tile, so about half the theoretical gain reaches wall-clock. Worth stating as a ratio rather than implying occupancy converts one-for-one.
 
 ## 2026-08-21 — Triton 123% of torch.matmul on 4090 is TF32
 
@@ -166,4 +212,9 @@ This file tracks dead ends, wrong assumptions, and regressions during kernel opt
 - Root cause: Ada `tl.dot` on float32 tensors uses TF32 Tensor Cores. Not a fair vs cuBLAS FP32. Do not put 123% on a resume.
 
 ### Next move
-- Quote T4 Triton **80.8% of torch.matmul** as the FP32 row. If a TF32 row is wanted later, set torch and Triton to TF32 explicitly and label it.
+- Quote the T4 row as the FP32 comparison. If a TF32 row is wanted, set torch and Triton to TF32 explicitly and label it.
+
+### Fix, verified on T4
+- `triton/matmul.py` now passes `input_precision="ieee"` to `tl.dot`, sets `torch.backends.cuda.matmul.allow_tf32 = False`, and gates on 1e-4 relative. A `--tf32` flag reports the Tensor Core row separately with the precision printed in the header.
+- On T4 both modes give byte-identical error (7.63e-05 / 1.60e-04) and the same ~78% ratio, which is the correct result: sm_75 has no TF32 path, so the flag is a no-op there. The T4 comparison was always fair; the 4090 one was not.
+- The T4 cannot demonstrate the fix works, only that it does no harm. The real check is re-running the 4090 with `--tf32` off and seeing max abs drop from 9.12e-02 to ~1e-4 with the ratio falling below 100%. Until that run happens, the fix is verified as plumbing, not as an outcome.
